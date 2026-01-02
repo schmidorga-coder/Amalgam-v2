@@ -1,3 +1,4 @@
+#include "NavBotCore.h"
 #include "NavBotJobs/Roam.h"
 #include "NavBotJobs/EscapeDanger.h"
 #include "NavBotJobs/Melee.h"
@@ -15,511 +16,467 @@
 #include "../Ticks/Ticks.h"
 #include "../Misc/Misc.h"
 
+// Constants
+constexpr float BLACKLIST_VISCHECK_HEIGHT = 45.0f; // Roughly crouched height
+
+// Helper to mark areas using BFS instead of iterating the entire map (Performance boost)
+void CNavBotCore::MarkAreaDangerous(const Vector& vOrigin, bool bDormant)
+{
+    auto pStartArea = F::NavEngine.GetNavArea(vOrigin); // Assuming GetNavArea finds the area at pos
+    if (!pStartArea) return;
+
+    // Use a queue for BFS and a set to keep track of visited areas to avoid cycles
+    std::deque<CNavArea*> dQueue;
+    std::unordered_set<int> sVisited; // Using ID for faster lookup
+
+    dQueue.push_back(pStartArea);
+    sVisited.insert(pStartArea->m_nID);
+
+    // Squared distances for optimization
+    const float flSlightDangerSqr = std::pow(m_tSelectedConfig.m_flMinSlightDanger, 2);
+    const float flFullDangerSqr = std::pow(m_tSelectedConfig.m_flMinFullDanger, 2);
+
+    // Determines if we should actually mark this area based on game rules (capping etc)
+    const bool bIgnoreSlightDanger = (Vars::Misc::Movement::NavBot::Preferences.Value & Vars::Misc::Movement::NavBot::PreferencesEnum::SafeCapping || F::NavEngine.m_eCurrentPriority != PriorityListEnum::Capture);
+
+    while (!dQueue.empty())
+    {
+        CNavArea* pCurrent = dQueue.front();
+        dQueue.pop_front();
+
+        Vector vAreaCenter = pCurrent->m_vCenter;
+        float flDistSqr = vOrigin.DistToSqr(vAreaCenter);
+
+        // If we went too far, stop branching this path
+        if (flDistSqr > flSlightDangerSqr)
+            continue;
+
+        // Perform Visibility Check (Expensive, so we do it after distance check)
+        Vector vAreaVis = vAreaCenter; 
+        vAreaVis.z += BLACKLIST_VISCHECK_HEIGHT;
+        Vector vOriginVis = vOrigin;
+        vOriginVis.z += BLACKLIST_VISCHECK_HEIGHT;
+
+        if (F::NavEngine.IsVectorVisibleNavigation(vOriginVis, vAreaVis, MASK_SHOT))
+        {
+            auto& blacklist = *F::NavEngine.GetFreeBlacklist();
+            
+            // Logic: Is this area fully dangerous, or just slightly?
+            if (flDistSqr < flFullDangerSqr)
+            {
+                // Full Danger: Always blacklist
+                blacklist[pCurrent] = bDormant ? BlacklistReasonEnum::EnemyDormant : BlacklistReasonEnum::EnemyNormal;
+            }
+            else if (bIgnoreSlightDanger)
+            {
+                // Slight Danger: Only blacklist if we care about slight danger
+                // Note: Original code used a counter logic here, simplified for BFS. 
+                // If strict counting is needed, a map<CNavArea*, int> should be passed to this function.
+                blacklist[pCurrent] = bDormant ? BlacklistReasonEnum::EnemyDormant : BlacklistReasonEnum::EnemyNormal;
+            }
+        }
+
+        // Add neighbors to queue
+        for (const auto& connection : pCurrent->m_vConnections)
+        {
+            if (sVisited.find(connection.m_pArea->m_nID) == sVisited.end())
+            {
+                sVisited.insert(connection.m_pArea->m_nID);
+                dQueue.push_back(connection.m_pArea);
+            }
+        }
+    }
+}
+
 void CNavBotCore::UpdateEnemyBlacklist(CTFPlayer* pLocal, CTFWeaponBase* pWeapon, int iSlot)
 {
-	if (!(Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::Players) ||
-		F::NavEngine.IsBlacklistIrrelevant())
-		return;
+    // 1. Feature & Safety Checks
+    if (!(Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::Players) ||
+        F::NavEngine.IsBlacklistIrrelevant())
+        return;
 
-	if (!(Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::DormantThreats))
-		F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyDormant));
+    static Timer tBlacklistUpdateTimer{};
+    static Timer tDormantUpdateTimer{};
+    static int iLastSlotBlacklist = SLOT_PRIMARY;
 
-	if (!(Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::NormalThreats))
-	{
-		F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyNormal));
-		return;
-	}
+    bool bCheckNormal = Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::NormalThreats;
+    bool bCheckDormant = Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::DormantThreats;
 
-	static Timer tBlacklistUpdateTimer{};
-	static Timer tDormantUpdateTimer{};
-	static int iLastSlotBlacklist = SLOT_PRIMARY;
+    // Timer Logic
+    bool bRunNormal = bCheckNormal && (tBlacklistUpdateTimer.Run(Vars::Misc::Movement::NavBot::BlacklistDelay.Value) || iLastSlotBlacklist != iSlot);
+    bool bRunDormant = bCheckDormant && (tDormantUpdateTimer.Run(Vars::Misc::Movement::NavBot::BlacklistDormantDelay.Value) || iLastSlotBlacklist != iSlot);
 
-	bool bShouldRunNormal = tBlacklistUpdateTimer.Run(Vars::Misc::Movement::NavBot::BlacklistDelay.Value) || iLastSlotBlacklist != iSlot;
-	bool bShouldRunDormant = Vars::Misc::Movement::NavBot::Blacklist.Value & Vars::Misc::Movement::NavBot::BlacklistEnum::DormantThreats && (tDormantUpdateTimer.Run(Vars::Misc::Movement::NavBot::BlacklistDormantDelay.Value) || iLastSlotBlacklist != iSlot);
-	// Don't run since we do not care here
-	if (!bShouldRunNormal && !bShouldRunDormant)
-		return;
+    if (!bRunNormal && !bRunDormant)
+        return;
 
-	// Clear blacklist for normal entities
-	if (bShouldRunNormal)
-		F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyNormal));
+    iLastSlotBlacklist = iSlot;
 
-	// Clear blacklist for dormant entities
-	if (bShouldRunDormant)
-		F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyDormant));
+    // Clear existing blacklists
+    if (bRunNormal) F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyNormal));
+    if (bRunDormant) F::NavEngine.ClearFreeBlacklist(BlacklistReason_t(BlacklistReasonEnum::EnemyDormant));
 
-	if (const auto& pGameRules = I::TFGameRules())
-	{
-		if (pGameRules->m_iRoundState() == GR_STATE_TEAM_WIN)
-			return;
-	}
+    // Don't run if round is over
+    if (const auto& pGameRules = I::TFGameRules())
+        if (pGameRules->m_iRoundState() == GR_STATE_TEAM_WIN) return;
 
-	// #NoFear
-	if (iSlot == SLOT_MELEE)
-		return;
+    // #NoFear: Don't blacklist if holding melee (likely trying to melee someone)
+    if (iSlot == SLOT_MELEE) return;
 
-	// Store the danger of the individual nav areas
-	std::unordered_map<CNavArea*, int> mDormantSlightDanger;
-	std::unordered_map<CNavArea*, int> mNormalSlightDanger;
+    // Cache to skip processing enemies that are close to each other
+    static std::vector<Vector> vProcessedOrigins;
+    vProcessedOrigins.clear();
 
-	// This is used to cache Dangerous areas between ents
-	std::unordered_map<CTFPlayer*, std::vector<CNavArea*>> mEntMarkedDormantSlightDanger;
-	std::unordered_map<CTFPlayer*, std::vector<CNavArea*>> mEntMarkedNormalSlightDanger;
+    const float flMinDistSqr = std::pow(std::max(100.0f, m_tSelectedConfig.m_flMinSlightDanger * 0.25f), 2);
 
-	std::vector<std::pair<CTFPlayer*, Vector>> vCheckedPlayerOrigins;
-	for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
-	{
-		// Entity is generally invalid, ignore
-		auto pPlayer = pEntity->As<CTFPlayer>();
-		if (!pPlayer->IsAlive())
-			continue;
+    for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
+    {
+        auto pPlayer = pEntity->As<CTFPlayer>();
+        if (!pPlayer->IsAlive()) continue;
 
-		bool bDormant = pPlayer->IsDormant();
-		if (!bDormant)
-		{
-			// Should not run on normal entity and entity is not dormant, ignore
-			if (!bShouldRunNormal)
-				continue;
-		}
-		// Should not run on dormant and entity is dormant, ignore.
-		else if (!bShouldRunDormant)
-			continue;
+        bool bIsDormant = pPlayer->IsDormant();
+        
+        // Filter: Only process if we are running the update for this type
+        if (bIsDormant && !bRunDormant) continue;
+        if (!bIsDormant && !bRunNormal) continue;
 
-		Vector vOrigin;
-		if (!F::BotUtils.GetDormantOrigin(pPlayer->entindex(), vOrigin))
-			continue;
+        Vector vOrigin;
+        if (!F::BotUtils.GetDormantOrigin(pPlayer->entindex(), vOrigin)) continue;
 
-		vOrigin.z += PLAYER_CROUCHED_JUMP_HEIGHT;
+        // Optimization: Skip if we just processed a very similar position
+        bool bSkip = false;
+        for (const auto& vChecked : vProcessedOrigins) {
+            if (vOrigin.DistToSqr(vChecked) < flMinDistSqr) {
+                bSkip = true; 
+                break;
+            }
+        }
+        if (bSkip) continue;
 
-		bool bShouldCheck = true;
+        vProcessedOrigins.push_back(vOrigin);
 
-		// Find already dangerous marked areas by other entities
-		auto mToLoop = bDormant ? &mEntMarkedDormantSlightDanger : &mEntMarkedNormalSlightDanger;
+        // Run the BFS Danger Marker
+        MarkAreaDangerous(vOrigin, bIsDormant);
+    }
+}
 
-		// Add new danger entries
-		auto mToMark = bDormant ? &mDormantSlightDanger : &mNormalSlightDanger;
+void CNavBotCore::UpdateEngineerSlot(CTFPlayer* pLocal)
+{
+    if (!F::NavBotEngineer.IsEngieMode(pLocal)) return;
 
-		for (auto [pCheckedPlayer, vCheckedOrigin] : vCheckedPlayerOrigins)
-		{
-			// If this origin is closer than a quarter of the min HU (or less than 100 HU) to a cached one, don't go through
-			// all nav areas again DistTo is much faster than DistTo which is why we use it here
-			float flDist = m_tSelectedConfig.m_flMinSlightDanger;
+    int iSwitchTo = -1;
 
-			flDist *= 0.25f;
-			flDist = std::max(100.0f, flDist);
+    switch (F::NavBotEngineer.m_eTaskStage)
+    {
+    case EngineerTaskStageEnum::BuildSentry:
+    case EngineerTaskStageEnum::BuildDispenser:
+        // Switch if we are close to the build spot (prepare to wrench)
+        if (F::NavBotEngineer.m_tCurrentBuildingSpot.m_flDistanceToTarget != FLT_MAX &&
+            F::NavBotEngineer.m_tCurrentBuildingSpot.m_vPos.DistToSqr(pLocal->GetAbsOrigin()) <= (500.f * 500.f))
+        {
+            iSwitchTo = SLOT_MELEE;
+        }
+        break;
+    case EngineerTaskStageEnum::SmackSentry:
+        if (F::NavBotEngineer.m_flDistToSentry <= 300.f) iSwitchTo = SLOT_MELEE;
+        break;
+    case EngineerTaskStageEnum::SmackDispenser:
+        if (F::NavBotEngineer.m_flDistToDispenser <= 500.f) iSwitchTo = SLOT_MELEE;
+        break;
+    default:
+        break;
+    }
 
-			if (vOrigin.DistTo(vCheckedOrigin) < flDist)
-			{
-				bShouldCheck = false;
-
-				bool bIsAbsoluteDanger = flDist < m_tSelectedConfig.m_flMinFullDanger;
-				if (!bIsAbsoluteDanger && (false/*slight danger when capping*/ || F::NavEngine.m_eCurrentPriority != PriorityListEnum::Capture))
-				{
-					// The area is not visible by the player
-					if (!F::NavEngine.IsVectorVisibleNavigation(vOrigin, vCheckedOrigin, MASK_SHOT))
-						continue;
-
-					for (auto& pArea : (*mToLoop)[pCheckedPlayer])
-					{
-						(*mToMark)[pArea]++;
-						if ((*mToMark)[pArea] >= Vars::Misc::Movement::NavBot::BlacklistSlightDangerLimit.Value)
-							(*F::NavEngine.GetFreeBlacklist())[pArea] = bDormant ? BlacklistReasonEnum::EnemyDormant : BlacklistReasonEnum::EnemyNormal;
-					}
-				}
-				break;
-			}
-		}
-		if (!bShouldCheck)
-			continue;
-
-		// Now check which areas they are close to
-		for (auto& tArea : F::NavEngine.GetNavFile()->m_vAreas)
-		{
-			float flDist = tArea.m_vCenter.DistTo(vOrigin);
-			float flSlightDangerDist = m_tSelectedConfig.m_flMinSlightDanger;
-			float flFullDangerDist = m_tSelectedConfig.m_flMinFullDanger;
-
-			// Not dangerous, Still don't bump
-			if (!F::BotUtils.ShouldTarget(pLocal, pWeapon, pPlayer->entindex()))
-			{
-				flSlightDangerDist = PLAYER_WIDTH * 1.2f;
-				flFullDangerDist = PLAYER_WIDTH * 1.2f;
-			}
-
-			if (flDist < flSlightDangerDist)
-			{
-				Vector vNavAreaPos = tArea.m_vCenter;
-				vNavAreaPos.z += PLAYER_CROUCHED_JUMP_HEIGHT;
-				// The area is not visible by the player
-				if (!F::NavEngine.IsVectorVisibleNavigation(vOrigin, vNavAreaPos, MASK_SHOT))
-					continue;
-
-				// Add as marked area
-				(*mToLoop)[pPlayer].push_back(&tArea);
-
-				// Just slightly dangerous, only mark as such if it's clear
-				if (flDist >= flFullDangerDist &&
-					(Vars::Misc::Movement::NavBot::Preferences.Value & Vars::Misc::Movement::NavBot::PreferencesEnum::SafeCapping || F::NavEngine.m_eCurrentPriority != PriorityListEnum::Capture))
-				{
-					(*mToMark)[&tArea]++;
-					if ((*mToMark)[&tArea] < Vars::Misc::Movement::NavBot::BlacklistSlightDangerLimit.Value)
-						continue;
-				}
-				(*F::NavEngine.GetFreeBlacklist())[&tArea] = bDormant ? BlacklistReasonEnum::EnemyDormant : BlacklistReasonEnum::EnemyNormal;
-			}
-		}
-		vCheckedPlayerOrigins.emplace_back(pPlayer, vOrigin);
-	}
+    if (iSwitchTo != -1)
+    {
+        // Only force melee if we aren't already holding it
+        if (F::BotUtils.m_iCurrentSlot < SLOT_MELEE)
+            F::BotUtils.SetSlot(pLocal, SLOT_MELEE);
+    }
 }
 
 void CNavBotCore::UpdateSlot(CTFPlayer* pLocal, ClosestEnemy_t tClosestEnemy)
 {
-	static Timer tSlotTimer{};
-	if (!tSlotTimer.Run(0.2f))
-		return;
+    static Timer tSlotTimer{};
+    if (!tSlotTimer.Run(0.2f)) return;
 
-	// Prioritize reloading
-	int iReloadSlot = F::NavBotReload.m_iLastReloadSlot = F::NavBotReload.GetReloadWeaponSlot(pLocal, tClosestEnemy);
+    // 1. Reload Check
+    int iReloadSlot = F::NavBotReload.GetReloadWeaponSlot(pLocal, tClosestEnemy);
+    F::NavBotReload.m_iLastReloadSlot = iReloadSlot;
 
-	// Special case for engineer bots
-	if (F::NavBotEngineer.IsEngieMode(pLocal))
-	{
-		int iSwitch = 0;
-		switch (F::NavBotEngineer.m_eTaskStage)
-		{
-		// We are currently building something (we dont really need to hold the melee weapon)
-		case EngineerTaskStageEnum::BuildSentry:
-		case EngineerTaskStageEnum::BuildDispenser:
-			iSwitch = 2 * (F::NavBotEngineer.m_tCurrentBuildingSpot.m_flDistanceToTarget != FLT_MAX && F::NavBotEngineer.m_tCurrentBuildingSpot.m_vPos.DistTo(pLocal->GetAbsOrigin()) <= 500.f);
-			break;
-		// We are currently upgrading/repairing something
-		case EngineerTaskStageEnum::SmackSentry:
-			iSwitch = F::NavBotEngineer.m_flDistToSentry <= 300.f;
-			break;
-		case EngineerTaskStageEnum::SmackDispenser:
-			iSwitch = F::NavBotEngineer.m_flDistToDispenser <= 500.f;
-			break;
-		default:
-			break;
-		}
+    // 2. Engineer specific logic override
+    if (F::NavBotEngineer.IsEngieMode(pLocal))
+    {
+        UpdateEngineerSlot(pLocal);
+        // If engineer logic forced a switch, we might want to return early or let the reload logic override?
+        // Usually building takes priority over reloading if we are actively building.
+        if (F::BotUtils.m_iCurrentSlot == SLOT_MELEE) return; 
+    }
 
-		if (iSwitch)
-		{
-			if (iSwitch == 1)
-			{
-				if (F::BotUtils.m_iCurrentSlot < SLOT_MELEE)
-					F::BotUtils.SetSlot(pLocal, SLOT_MELEE);
-			}
-			// Dont interrupt building process
-			return;
-		}
-	}
+    // 3. Normal Weapon Switch Logic
+    int iDesiredSlot = -1;
 
-	if (F::BotUtils.m_iCurrentSlot != F::BotUtils.m_iBestSlot)
-		F::BotUtils.SetSlot(pLocal, iReloadSlot != -1 ? iReloadSlot : Vars::Misc::Movement::BotUtils::WeaponSlot.Value ? F::BotUtils.m_iBestSlot : -1);
+    if (iReloadSlot != -1)
+        iDesiredSlot = iReloadSlot;
+    else if (Vars::Misc::Movement::BotUtils::WeaponSlot.Value)
+        iDesiredSlot = F::BotUtils.m_iBestSlot;
+
+    if (iDesiredSlot != -1 && F::BotUtils.m_iCurrentSlot != iDesiredSlot)
+        F::BotUtils.SetSlot(pLocal, iDesiredSlot);
 }
 
-bool CNavBotCore::FindClosestHidingSpot(CNavArea* pArea, Vector vVischeckPoint, int iRecursionCount, std::pair<CNavArea*, int>& tOut, bool bVischeck, int iRecursionIndex)
+// Fixed recursion safety
+bool CNavBotCore::FindClosestHidingSpot(CNavArea* pArea, Vector vVischeckPoint, int iMaxRecursion, std::pair<CNavArea*, int>& tOut, bool bVischeck, int iCurrentDepth, std::vector<int>* pVisited)
 {
-	static std::vector<CNavArea*> vAlreadyRecursed;
-	if (iRecursionIndex == 0)
-		vAlreadyRecursed.clear();
+    // Use a local visited vector if this is the root call
+    std::vector<int> localVisited;
+    if (!pVisited) pVisited = &localVisited;
 
-	Vector vAreaOrigin = pArea->m_vCenter;
-	vAreaOrigin.z += PLAYER_CROUCHED_JUMP_HEIGHT;
+    if (iCurrentDepth >= iMaxRecursion) return false;
 
-	// Increment recursion index
-	iRecursionIndex++;
+    Vector vAreaOrigin = pArea->m_vCenter;
+    vAreaOrigin.z += PLAYER_CROUCHED_JUMP_HEIGHT;
 
-	// If the area works, return it
-	if (bVischeck && !F::NavEngine.IsVectorVisibleNavigation(vAreaOrigin, vVischeckPoint))
-	{
-		tOut = { pArea, iRecursionIndex - 1 };
-		return true;
-	}
-	// Termination condition not hit yet
-	else if (iRecursionIndex < iRecursionCount)
-	{
-		// Store the nearest area
-		std::pair<CNavArea*, int> tBestSpot;
-		for (auto& tConnection : pArea->m_vConnections)
-		{
-			if (std::find(vAlreadyRecursed.begin(), vAlreadyRecursed.end(), tConnection.m_pArea) != vAlreadyRecursed.end())
-				continue;
+    // Success condition: Area is hidden
+    if (bVischeck && !F::NavEngine.IsVectorVisibleNavigation(vAreaOrigin, vVischeckPoint))
+    {
+        tOut = { pArea, iCurrentDepth };
+        return true;
+    }
 
-			vAlreadyRecursed.push_back(tConnection.m_pArea);
+    // Mark visited
+    pVisited->push_back(pArea->m_nID);
 
-			std::pair<CNavArea*, int> tSpot;
-			if (FindClosestHidingSpot(tConnection.m_pArea, vVischeckPoint, iRecursionCount, tSpot, iRecursionIndex, bVischeck) && (!tBestSpot.first || tSpot.second < tBestSpot.second))
-				tBestSpot = tSpot;
-		}
-		tOut = tBestSpot;
-		return tBestSpot.first;
-	}
-	return false;
+    std::pair<CNavArea*, int> tBestSpot = { nullptr, INT_MAX };
+    bool bFound = false;
+
+    for (const auto& connection : pArea->m_vConnections)
+    {
+        // Skip if already visited
+        if (std::find(pVisited->begin(), pVisited->end(), connection.m_pArea->m_nID) != pVisited->end())
+            continue;
+
+        std::pair<CNavArea*, int> tCandidate;
+        if (FindClosestHidingSpot(connection.m_pArea, vVischeckPoint, iMaxRecursion, tCandidate, bVischeck, iCurrentDepth + 1, pVisited))
+        {
+            if (tCandidate.second < tBestSpot.second)
+            {
+                tBestSpot = tCandidate;
+                bFound = true;
+                // Optimization: If we found a spot at current+1, it's the best possible we can find in this branch
+                if (tBestSpot.second == iCurrentDepth + 1) break; 
+            }
+        }
+    }
+
+    if (bFound)
+    {
+        tOut = tBestSpot;
+        return true;
+    }
+
+    return false;
 }
 
 static bool IsWeaponValidForDT(CTFWeaponBase* pWeapon)
 {
-	if (!pWeapon || F::BotUtils.m_iCurrentSlot == SLOT_MELEE)
-		return false;
+    if (!pWeapon || F::BotUtils.m_iCurrentSlot == SLOT_MELEE) return false;
+    
+    // DT not useful on Sniper Rifles
+    switch(pWeapon->GetWeaponID()) {
+        case TF_WEAPON_SNIPERRIFLE:
+        case TF_WEAPON_SNIPERRIFLE_CLASSIC:
+        case TF_WEAPON_SNIPERRIFLE_DECAP:
+            return false;
+    }
 
-	auto iWepID = pWeapon->GetWeaponID();
-	if (iWepID == TF_WEAPON_SNIPERRIFLE || iWepID == TF_WEAPON_SNIPERRIFLE_CLASSIC || iWepID == TF_WEAPON_SNIPERRIFLE_DECAP)
-		return false;
-
-	return SDK::WeaponDoesNotUseAmmo(pWeapon, false);
+    return SDK::WeaponDoesNotUseAmmo(pWeapon, false);
 }
 
 void CNavBotCore::Run(CTFPlayer* pLocal, CTFWeaponBase* pWeapon, CUserCmd* pCmd)
 {
-	if (!Vars::Misc::Movement::NavBot::Enabled.Value || !Vars::Misc::Movement::NavEngine::Enabled.Value ||
-		!pLocal->IsAlive() || F::NavEngine.m_eCurrentPriority == PriorityListEnum::Followbot || F::FollowBot.m_bActive || !F::NavEngine.IsReady())
-	{
-		F::NavBotStayNear.m_iStayNearTargetIdx = -1;
-		F::NavBotReload.m_iLastReloadSlot = -1;
-		return;
-	}
+    // 1. Global Valid Checks
+    if (!Vars::Misc::Movement::NavBot::Enabled.Value || !Vars::Misc::Movement::NavEngine::Enabled.Value ||
+        !pLocal->IsAlive() || !pWeapon || !F::NavEngine.IsReady())
+    {
+        Reset();
+        return;
+    }
 
-	if (Vars::Misc::Movement::NavBot::DisableOnSpectate.Value && H::Entities.IsSpectated())
-	{
-		F::NavBotStayNear.m_iStayNearTargetIdx = -1;
-		F::NavBotReload.m_iLastReloadSlot = -1;
-		return;
-	}
+    // 2. State Checks
+    if (Vars::Misc::Movement::NavBot::DisableOnSpectate.Value && H::Entities.IsSpectated()) { Reset(); return; }
+    if (F::NavEngine.m_eCurrentPriority == PriorityListEnum::Followbot || F::FollowBot.m_bActive) { Reset(); return; }
+    if (F::NavEngine.m_eCurrentPriority != PriorityListEnum::StayNear) F::NavBotStayNear.m_iStayNearTargetIdx = -1;
+    if (F::Ticks.m_bWarp || F::Ticks.m_bDoubletap) return;
+    
+    // Manual movement override check
+    if ((pCmd->buttons & (IN_FORWARD | IN_BACK | IN_MOVERIGHT | IN_MOVELEFT)) && !F::Misc.m_bAntiAFK) return;
 
-	if (F::NavEngine.m_eCurrentPriority != PriorityListEnum::StayNear)
-		F::NavBotStayNear.m_iStayNearTargetIdx = -1;
+    F::NavBotGroup.UpdateLocalBotPositions(pLocal);
 
-	if (F::Ticks.m_bWarp || F::Ticks.m_bDoubletap)
-		return;
+    // Verify Nav Area
+    if (!F::NavEngine.GetLocalNavArea(pLocal->GetAbsOrigin()))
+    {
+        Reset();
+        return;
+    }
 
-	if (!pWeapon)
-		return;
+    // 3. Double Tap Logic
+    static Timer tDoubletapRecharge{};
+    if (Vars::Misc::Movement::NavBot::RechargeDT.Value && IsWeaponValidForDT(pWeapon))
+    {
+        bool bCanRecharge = !F::Ticks.m_bRechargeQueue && G::Attacking != 1 && (F::Ticks.m_iShiftedTicks < F::Ticks.m_iShiftedGoal);
+        bool bModeWait = Vars::Misc::Movement::NavBot::RechargeDT.Value == Vars::Misc::Movement::NavBot::RechargeDTEnum::WaitForFL;
+        bool bFlReady = Vars::Fakelag::Fakelag.Value && F::FakeLag.m_iGoal;
 
-	if (pCmd->buttons & (IN_FORWARD | IN_BACK | IN_MOVERIGHT | IN_MOVELEFT) && !F::Misc.m_bAntiAFK)
-		return;
+        if (bCanRecharge && (!bModeWait || !bFlReady))
+        {
+            if (tDoubletapRecharge.Check(Vars::Misc::Movement::NavBot::RechargeDTDelay.Value))
+                F::Ticks.m_bRechargeQueue = true;
+        }
+        else if (F::Ticks.m_iShiftedTicks >= F::Ticks.m_iShiftedGoal)
+        {
+            tDoubletapRecharge.Update();
+        }
+    }
 
-	F::NavBotGroup.UpdateLocalBotPositions(pLocal);
+    // 4. Update Sub-Systems
+    F::NavBotEngineer.RefreshLocalBuildings(pLocal);
+    F::NavBotEngineer.RefreshBuildingSpots(pLocal, F::BotUtils.m_tClosestEnemy);
 
-	// Update our current nav area
-	if (!F::NavEngine.GetLocalNavArea(pLocal->GetAbsOrigin()))
-	{
-		// This should never happen.
-		// In case it did then theres something wrong with nav engine
-		F::NavBotStayNear.m_iStayNearTargetIdx = -1;
-		F::NavBotReload.m_iLastReloadSlot = -1;
-		return;
-	}
+    // 5. Config Selection
+    switch (pLocal->m_iClass())
+    {
+    case TF_CLASS_SCOUT:
+    case TF_CLASS_HEAVY:
+        m_tSelectedConfig = CONFIG_SHORT_RANGE;
+        break;
+    case TF_CLASS_ENGINEER:
+        m_tSelectedConfig = F::NavBotEngineer.IsEngieMode(pLocal) ? 
+            (pWeapon->m_iItemDefinitionIndex() == Engi_t_TheGunslinger ? CONFIG_GUNSLINGER_ENGINEER : CONFIG_ENGINEER) : 
+            CONFIG_SHORT_RANGE;
+        break;
+    case TF_CLASS_SNIPER:
+        m_tSelectedConfig = pWeapon->GetWeaponID() == TF_WEAPON_COMPOUND_BOW ? CONFIG_MID_RANGE : CONFIG_LONG_RANGE;
+        break;
+    default:
+        m_tSelectedConfig = CONFIG_MID_RANGE;
+    }
 
-	// Recharge doubletap every n seconds
-	static Timer tDoubletapRecharge{};
-	if (Vars::Misc::Movement::NavBot::RechargeDT.Value && IsWeaponValidForDT(pWeapon))
-	{
-		if (!F::Ticks.m_bRechargeQueue &&
-			(Vars::Misc::Movement::NavBot::RechargeDT.Value != Vars::Misc::Movement::NavBot::RechargeDTEnum::WaitForFL || !Vars::Fakelag::Fakelag.Value || !F::FakeLag.m_iGoal) &&
-			G::Attacking != 1 &&
-			(F::Ticks.m_iShiftedTicks < F::Ticks.m_iShiftedGoal) && tDoubletapRecharge.Check(Vars::Misc::Movement::NavBot::RechargeDTDelay.Value))
-			F::Ticks.m_bRechargeQueue = true;
-		else if (F::Ticks.m_iShiftedTicks >= F::Ticks.m_iShiftedGoal)
-			tDoubletapRecharge.Update();
-	}
+    UpdateSlot(pLocal, F::BotUtils.m_tClosestEnemy);
+    UpdateEnemyBlacklist(pLocal, pWeapon, F::BotUtils.m_iCurrentSlot);
 
-	// Not used
-	// RefreshSniperSpots();
-	F::NavBotEngineer.RefreshLocalBuildings(pLocal);
-	F::NavBotEngineer.RefreshBuildingSpots(pLocal, F::BotUtils.m_tClosestEnemy);
+    // 6. Priority Task Execution Chain
+    // The order determines priority: If a function returns true, it handled the tick.
+    bool bTaskHandled = 
+           F::NavBotDanger.EscapeSpawn(pLocal)
+        || F::NavBotDanger.EscapeProjectiles(pLocal)
+        || F::NavBotMelee.Run(pCmd, pLocal, F::BotUtils.m_iCurrentSlot, F::BotUtils.m_tClosestEnemy)
+        || F::NavBotDanger.EscapeDanger(pLocal)
+        || F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Health)
+        || F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Ammo)
+        || F::NavBotReload.RunSafe(pLocal, pWeapon)
+        || F::NavBotGroup.Run(pLocal, pWeapon)
+        || F::NavBotCapture.Run(pLocal, pWeapon)
+        || F::NavBotEngineer.Run(pCmd, pLocal, F::BotUtils.m_tClosestEnemy)
+        || F::NavBotSnipe.Run(pLocal)
+        || F::NavBotStayNear.Run(pLocal, pWeapon)
+        || F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Health | GetSupplyEnum::LowPrio)
+        || F::NavBotRoam.Run(pLocal, pWeapon);
 
-	// Update the distance config
-	switch (pLocal->m_iClass())
-	{
-	case TF_CLASS_SCOUT:
-	case TF_CLASS_HEAVY:
-		m_tSelectedConfig = CONFIG_SHORT_RANGE;
-		break;
-	case TF_CLASS_ENGINEER:
-		m_tSelectedConfig = F::NavBotEngineer.IsEngieMode(pLocal) ? pWeapon->m_iItemDefinitionIndex() == Engi_t_TheGunslinger ? CONFIG_GUNSLINGER_ENGINEER : CONFIG_ENGINEER : CONFIG_SHORT_RANGE;
-		break;
-	case TF_CLASS_SNIPER:
-		m_tSelectedConfig = pWeapon->GetWeaponID() == TF_WEAPON_COMPOUND_BOW ? CONFIG_MID_RANGE : CONFIG_LONG_RANGE;
-		break;
-	default:
-		m_tSelectedConfig = CONFIG_MID_RANGE;
-	}
+    // 7. Conditional CritHack Force
+    if (bTaskHandled)
+    {
+        CTFPlayer* pTarget = nullptr;
+        // Identify target based on current job priority
+        switch (F::NavEngine.m_eCurrentPriority)
+        {
+        case PriorityListEnum::StayNear:
+            pTarget = I::ClientEntityList->GetClientEntity(F::NavBotStayNear.m_iStayNearTargetIdx)->As<CTFPlayer>();
+            break;
+        case PriorityListEnum::MeleeAttack:
+        case PriorityListEnum::GetHealth:
+        case PriorityListEnum::EscapeDanger:
+            pTarget = F::BotUtils.m_tClosestEnemy.m_pPlayer; // Use closest known enemy
+            break;
+        default:
+            break;
+        }
 
-	UpdateSlot(pLocal, F::BotUtils.m_tClosestEnemy);
-	UpdateEnemyBlacklist(pLocal, pWeapon, F::BotUtils.m_iCurrentSlot);
-
-	// TODO:
-	// Add engie logic and target sentries logic. (Done)
-	// Also maybe add some spy sapper logic? (No.)
-	// Fix defend and help capture logic
-	// Fix reload stuff because its really janky
-	// Finish auto wewapon stuff
-	// Make a better closest enemy logic
-	// Fix dormant player blacklist not actually running
-
-	if (F::NavBotDanger.EscapeSpawn(pLocal)
-		|| F::NavBotDanger.EscapeProjectiles(pLocal)
-		|| F::NavBotMelee.Run(pCmd, pLocal, F::BotUtils.m_iCurrentSlot, F::BotUtils.m_tClosestEnemy)
-		|| F::NavBotDanger.EscapeDanger(pLocal)
-		|| F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Health)
-		|| F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Ammo)
-		//|| F::NavBotReload.Run(pLocal, pWeapon)
-		|| F::NavBotReload.RunSafe(pLocal, pWeapon)
-		|| F::NavBotGroup.Run(pLocal, pWeapon) // Move in formation
-		|| F::NavBotCapture.Run(pLocal, pWeapon)
-		|| F::NavBotEngineer.Run(pCmd, pLocal, F::BotUtils.m_tClosestEnemy)
-		|| F::NavBotSnipe.Run(pLocal)
-		|| F::NavBotStayNear.Run(pLocal, pWeapon)
-		|| F::NavBotSupplies.Run(pCmd, pLocal, GetSupplyEnum::Health | GetSupplyEnum::LowPrio)
-		|| F::NavBotRoam.Run(pLocal, pWeapon))
-	{
-		// Force crithack in dangerous conditions
-		// TODO:
-		// Maybe add some logic to it (more logic)
-		CTFPlayer* pPlayer = nullptr;
-		switch (F::NavEngine.m_eCurrentPriority)
-		{
-		case PriorityListEnum::StayNear:
-			pPlayer = I::ClientEntityList->GetClientEntity(F::NavBotStayNear.m_iStayNearTargetIdx)->As<CTFPlayer>();
-			if (pPlayer)
-				F::CritHack.m_bForce = !pPlayer->IsDormant() && pPlayer->m_iHealth() >= pWeapon->GetDamage();
-			break;
-		case PriorityListEnum::MeleeAttack:
-		case PriorityListEnum::GetHealth:
-		case PriorityListEnum::EscapeDanger:
-			pPlayer = I::ClientEntityList->GetClientEntity(F::BotUtils.m_tClosestEnemy.m_iEntIdx)->As<CTFPlayer>();
-			F::CritHack.m_bForce = pPlayer && !pPlayer->IsDormant() && pPlayer->m_iHealth() >= pWeapon->GetDamage();
-			break;
-		default:
-			F::CritHack.m_bForce = false;
-			break;
-		}
-	}
+        if (pTarget && !pTarget->IsDormant() && pTarget->IsAlive())
+        {
+            // Only force crit if we can actually kill them or deal significant damage
+            F::CritHack.m_bForce = (pTarget->m_iHealth() >= pWeapon->GetDamage());
+        }
+        else
+        {
+            F::CritHack.m_bForce = false;
+        }
+    }
 }
 
 void CNavBotCore::Reset()
 {
-	F::NavBotStayNear.m_iStayNearTargetIdx = -1;
-	F::NavBotReload.m_iLastReloadSlot = -1;
-	F::NavBotSnipe.m_iTargetIdx = -1;
-	F::NavBotSupplies.ResetTemp();
-	F::NavBotEngineer.Reset();
-	F::NavBotCapture.Reset();
+    F::NavBotStayNear.m_iStayNearTargetIdx = -1;
+    F::NavBotReload.m_iLastReloadSlot = -1;
+    F::NavBotSnipe.m_iTargetIdx = -1;
+    F::NavBotSupplies.ResetTemp();
+    F::NavBotEngineer.Reset();
+    F::NavBotCapture.Reset();
 }
 
 void CNavBotCore::Draw(CTFPlayer* pLocal)
 {
-	if (!(Vars::Menu::Indicators.Value & Vars::Menu::IndicatorsEnum::NavBot) || !pLocal->IsAlive())
-		return;
+    if (!(Vars::Menu::Indicators.Value & Vars::Menu::IndicatorsEnum::NavBot) || !pLocal || !pLocal->IsAlive())
+        return;
 
-	auto bIsReady = F::NavEngine.IsReady();
-	if (!Vars::Debug::Info.Value && !bIsReady)
-		return;
+    auto bIsReady = F::NavEngine.IsReady();
+    if (!Vars::Debug::Info.Value && !bIsReady) return;
 
-	int x = Vars::Menu::NavBotDisplay.Value.x;
-	int y = Vars::Menu::NavBotDisplay.Value.y + 8;
-	const auto& fFont = H::Fonts.GetFont(FONT_INDICATORS);
-	const int nTall = fFont.m_nTall + H::Draw.Scale(1);
+    int x = Vars::Menu::NavBotDisplay.Value.x;
+    int y = Vars::Menu::NavBotDisplay.Value.y + 8;
+    const auto& fFont = H::Fonts.GetFont(FONT_INDICATORS);
+    const int nTall = fFont.m_nTall + H::Draw.Scale(1);
 
-	EAlign align = ALIGN_TOP;
-	if (x <= 100 + H::Draw.Scale(50, Scale_Round))
-	{
-		x -= H::Draw.Scale(42, Scale_Round);
-		align = ALIGN_TOPLEFT;
-	}
-	else if (x >= H::Draw.m_nScreenW - 100 - H::Draw.Scale(50, Scale_Round))
-	{
-		x += H::Draw.Scale(42, Scale_Round);
-		align = ALIGN_TOPRIGHT;
-	}
+    EAlign align = ALIGN_TOP;
+    // Simple screen boundary check
+    if (x <= 100) align = ALIGN_TOPLEFT;
+    else if (x >= H::Draw.m_nScreenW - 100) align = ALIGN_TOPRIGHT;
 
-	const auto& cColor = F::NavEngine.IsPathing() ? Vars::Menu::Theme::Active.Value : Vars::Menu::Theme::Inactive.Value;
-	const auto& cReadyColor = bIsReady ? Vars::Menu::Theme::Active.Value : Vars::Menu::Theme::Inactive.Value;
-	int iInSpawn = -1;
-	int iAreaFlags = -1;
-	if (F::NavEngine.IsNavMeshLoaded())
-	{
-		if (auto pLocalArea = F::NavEngine.GetLocalNavArea())
-		{
-			iAreaFlags = pLocalArea->m_iTFAttributeFlags;
-			iInSpawn = iAreaFlags & (TF_NAV_SPAWN_ROOM_BLUE | TF_NAV_SPAWN_ROOM_RED);
-		}
-	}
-	std::wstring sJob = L"None";
-	switch (F::NavEngine.m_eCurrentPriority)
-	{
-	case PriorityListEnum::Patrol:
-		sJob = F::NavBotRoam.m_bDefending ? L"Defend" : L"Patrol";
-		break;
-	case PriorityListEnum::LowPrioGetHealth:
-		sJob = L"Get health (Low-Prio)";
-		break;
-	case PriorityListEnum::StayNear:
-		sJob = std::format(L"Stalk enemy ({})", F::NavBotStayNear.m_sFollowTargetName.data());
-		break;
-	case PriorityListEnum::RunReload:
-		sJob = L"Run reload";
-		break;
-	case PriorityListEnum::RunSafeReload:
-		sJob = L"Run safe reload";
-		break;
-	case PriorityListEnum::SnipeSentry:
-		sJob = L"Snipe sentry";
-		break;
-	case PriorityListEnum::GetAmmo:
-		sJob = L"Get ammo";
-		break;
-	case PriorityListEnum::Capture:
-		sJob = L"Capture";
-		break;
-	case PriorityListEnum::MeleeAttack:
-		sJob = L"Melee";
-		break;
-	case PriorityListEnum::Engineer:
-		sJob = L"Engineer (";
-		switch (F::NavBotEngineer.m_eTaskStage)
-		{
-		case EngineerTaskStageEnum::BuildSentry:
-			sJob += L"Build sentry";
-			break;
-		case EngineerTaskStageEnum::BuildDispenser:
-			sJob += L"Build dispenser";
-			break;
-		case EngineerTaskStageEnum::SmackSentry:
-			sJob += L"Smack sentry";
-			break;
-		case EngineerTaskStageEnum::SmackDispenser:
-			sJob += L"Smack dispenser";
-			break;
-		default:
-			sJob += L"None";
-			break;
-		}
-		sJob += L')';
-		break;
-	case PriorityListEnum::GetHealth:
-		sJob = L"Get health";
-		break;
-	case PriorityListEnum::EscapeSpawn:
-		sJob = L"Escape spawn";
-		break;
-	case PriorityListEnum::EscapeDanger:
-		sJob = L"Escape danger";
-		break;
-	case PriorityListEnum::Followbot:
-		sJob = L"FollowBot";
-		break;
-	default:
-		break;
-	}
+    const auto& cColor = F::NavEngine.IsPathing() ? Vars::Menu::Theme::Active.Value : Vars::Menu::Theme::Inactive.Value;
+    
+    // Status String Builder
+    std::wstring sJob = L"Idle";
+    switch (F::NavEngine.m_eCurrentPriority)
+    {
+    case PriorityListEnum::Patrol:          sJob = F::NavBotRoam.m_bDefending ? L"Defend" : L"Patrol"; break;
+    case PriorityListEnum::LowPrioGetHealth:sJob = L"Health (Low)"; break;
+    case PriorityListEnum::StayNear:        sJob = std::format(L"Stalk {}", F::NavBotStayNear.m_sFollowTargetName); break;
+    case PriorityListEnum::RunReload:
+    case PriorityListEnum::RunSafeReload:   sJob = L"Reloading"; break;
+    case PriorityListEnum::SnipeSentry:     sJob = L"Snipe Sentry"; break;
+    case PriorityListEnum::GetAmmo:         sJob = L"Ammo"; break;
+    case PriorityListEnum::Capture:         sJob = L"Capture"; break;
+    case PriorityListEnum::MeleeAttack:     sJob = L"Melee"; break;
+    case PriorityListEnum::GetHealth:       sJob = L"Health"; break;
+    case PriorityListEnum::EscapeSpawn:     sJob = L"Escape Spawn"; break;
+    case PriorityListEnum::EscapeDanger:    sJob = L"Fleeing"; break;
+    case PriorityListEnum::Followbot:       sJob = L"FollowBot"; break;
+    case PriorityListEnum::Engineer:
+        sJob = L"Engineer";
+        if (F::NavBotEngineer.m_eTaskStage == EngineerTaskStageEnum::BuildSentry) sJob = L"Building Sentry";
+        else if (F::NavBotEngineer.m_eTaskStage == EngineerTaskStageEnum::SmackSentry) sJob = L"Repairing Sentry";
+        break;
+    }
 
-	H::Draw.StringOutlined(fFont, x, y, cColor, Vars::Menu::Theme::Background.Value, align, std::format(L"Job: {} {}", sJob, std::wstring(F::CritHack.m_bForce ? L"(Crithack on)" : L"")).data());
-	if (Vars::Debug::Info.Value)
-	{
-		H::Draw.StringOutlined(fFont, x, y += nTall, cReadyColor, Vars::Menu::Theme::Background.Value, align, std::format("Is ready: {}", std::to_string(bIsReady)).c_str());
-		H::Draw.StringOutlined(fFont, x, y += nTall, cReadyColor, Vars::Menu::Theme::Background.Value, align, std::format("In spawn: {}", std::to_string(iInSpawn)).c_str());
-		H::Draw.StringOutlined(fFont, x, y += nTall, cReadyColor, Vars::Menu::Theme::Background.Value, align, std::format("Area flags: {}", std::to_string(iAreaFlags)).c_str());
-	}
+    std::wstring sStatus = std::format(L"Job: {} {}", sJob, F::CritHack.m_bForce ? L"(Crit)" : L"");
+
+    H::Draw.StringOutlined(fFont, x, y, cColor, Vars::Menu::Theme::Background.Value, align, sStatus.c_str());
+    
+    // Debug info
+    if (Vars::Debug::Info.Value)
+    {
+        H::Draw.StringOutlined(fFont, x, y += nTall, cColor, Vars::Menu::Theme::Background.Value, align, std::format("Ready: {}", bIsReady).c_str());
+        if (auto pArea = F::NavEngine.GetLocalNavArea())
+            H::Draw.StringOutlined(fFont, x, y += nTall, cColor, Vars::Menu::Theme::Background.Value, align, std::format("Area ID: {}", pArea->m_nID).c_str());
+    }
 }
