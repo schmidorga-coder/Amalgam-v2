@@ -1,0 +1,75 @@
+# .github/workflows/msbuild.yml
+name: MSBuild (Windows)
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  BUILD_CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+
+jobs:
+  build:
+    name: Build (${{ env.BUILD_PLATFORM }}, ${{ env.BUILD_CONFIGURATION }})
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Makes msbuild.exe available on PATH.
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # If your solution uses NuGet/packages.config or SDK-style projects, this helps.
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\\.nuget\\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.sln', '**/*.csproj', '**/*.vcxproj', '**/packages.config', '**/*.props', '**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Locate solution (.sln)
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1
+          if (-not $sln) {
+            Write-Error "No .sln file found. If you build via CMake, use the CMake workflow, or set SOLUTION_PATH manually."
+            exit 1
+          }
+          "SOLUTION_PATH=$($sln.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using solution: $($sln.FullName)"
+
+      - name: Restore NuGet
+        shell: pwsh
+        run: |
+          nuget restore "${env:SOLUTION_PATH}" -NonInteractive
+
+      - name: Build with MSBuild
+        shell: pwsh
+        run: |
+          msbuild "${env:SOLUTION_PATH}" `
+            /m `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM} `
+            /p:RestorePackages=false `
+            /verbosity:minimal
+
+      # Upload common output folders (works for many VS C++/.NET layouts).
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amalgam-v2-${{ env.BUILD_PLATFORM }}-${{ env.BUILD_CONFIGURATION }}
+          path: |
+            **\\bin\\${{ env.BUILD_CONFIGURATION }}\\**
+            **\\obj\\${{ env.BUILD_CONFIGURATION }}\\**
+            **\\${{ env.BUILD_PLATFORM }}\\${{ env.BUILD_CONFIGURATION }}\\**
+          if-no-files-found: ignore
