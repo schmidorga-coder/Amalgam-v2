@@ -1,36 +1,76 @@
+# .github/workflows/msbuild.yml
 name: MSBuild
 
-on: [push, pull_request]
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
 
 jobs:
   msbuild:
+    name: Build (${{ matrix.platform }}, ${{ matrix.configuration }})
     runs-on: windows-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        configuration: [Release, ReleaseAVX2, ReleaseFreetype, ReleaseFreetypeAVX2, ReleaseTextmode, ReleaseTextmodeAVX2]
+        configuration:
+          - Release
+          - ReleaseAVX2
+          - ReleaseFreetype
+          - ReleaseFreetypeAVX2
+          - ReleaseTextmode
+          - ReleaseTextmodeAVX2
         platform: [x64]
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-    - name: Restore NuGet packages
-      working-directory: ${{ env.GITHUB_WORKSPACE }}
-      run: nuget restore
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
 
-    - name: Build
-      working-directory: ${{ env.GITHUB_WORKSPACE }}
-      run: msbuild Amalgam.sln /p:Platform=${{ matrix.platform }} /p:Configuration=${{ matrix.configuration }}
-    
-    - uses: actions/upload-artifact@v4
-      with:
-        name: Amalgam${{ matrix.platform }}${{ matrix.configuration }}
-        path: output/${{ matrix.platform }}/${{ matrix.configuration }}/*.dll
-    
-    - uses: actions/upload-artifact@v4
-      with:
-        name: Amalgam${{ matrix.platform }}${{ matrix.configuration }}PDB
-        path: output/${{ matrix.platform }}/${{ matrix.configuration }}/*.pdb
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\\.nuget\\packages
+            packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.sln', '**/*.csproj', '**/*.vcxproj', '**/packages.config', '**/*.props', '**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          if (!(Test-Path .\Amalgam.sln)) {
+            Write-Error "Amalgam.sln not found at repository root. Update the path in the workflow (e.g. .\\path\\to\\Amalgam.sln)."
+            exit 1
+          }
+          nuget restore .\Amalgam.sln -NonInteractive
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild .\Amalgam.sln /m `
+            /p:Platform=${{ matrix.platform }} `
+            /p:Configuration=${{ matrix.configuration }} `
+            /verbosity:minimal
+
+      - name: Upload DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-dll
+          path: output\\${{ matrix.platform }}\\${{ matrix.configuration }}\\*.dll
+          if-no-files-found: error
+
+      - name: Upload PDBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
+          path: output\\${{ matrix.platform }}\\${{ matrix.configuration }}\\*.pdb
+          if-no-files-found: warn
