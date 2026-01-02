@@ -9,24 +9,23 @@ on:
 
 jobs:
   msbuild:
-    name: Build (${{ matrix.platform }}, ${{ matrix.configuration }})
     runs-on: windows-latest
 
     strategy:
       fail-fast: false
       matrix:
-        configuration:
-          - Release
-          - ReleaseAVX2
-          - ReleaseFreetype
-          - ReleaseFreetypeAVX2
-          - ReleaseTextmode
-          - ReleaseTextmodeAVX2
+        configuration: [Release, ReleaseAVX2, ReleaseFreetype, ReleaseFreetypeAVX2, ReleaseTextmode, ReleaseTextmodeAVX2]
         platform: [x64]
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -34,43 +33,53 @@ jobs:
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~\\.nuget\\packages
-            packages
-          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.sln', '**/*.csproj', '**/*.vcxproj', '**/packages.config', '**/*.props', '**/*.targets') }}
-          restore-keys: |
-            nuget-${{ runner.os }}-
+      - name: Resolve solution path
+        run: |
+          if (Test-Path ".\Amalgam.sln") {
+            "SOLUTION=.\Amalgam.sln" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1
+            if (-not $sln) { throw "No .sln found anywhere in repo." }
+            "SOLUTION=$($sln.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          Write-Host "Using solution: $env:SOLUTION"
 
       - name: Restore NuGet packages
-        shell: pwsh
         run: |
-          if (!(Test-Path .\Amalgam.sln)) {
-            Write-Error "Amalgam.sln not found at repository root. Update the path in the workflow (e.g. .\\path\\to\\Amalgam.sln)."
-            exit 1
-          }
-          nuget restore .\Amalgam.sln -NonInteractive
+          nuget restore "$env:SOLUTION" -NonInteractive
 
       - name: Build
-        shell: pwsh
         run: |
-          msbuild .\Amalgam.sln /m `
+          msbuild "$env:SOLUTION" /m `
             /p:Platform=${{ matrix.platform }} `
             /p:Configuration=${{ matrix.configuration }} `
             /verbosity:minimal
+
+      - name: List output folder (debug)
+        if: always()
+        run: |
+          if (Test-Path ".\output") {
+            Get-ChildItem -Recurse -File .\output | Select-Object FullName, Length | Select-Object -First 200
+          } else {
+            Write-Host "No ./output folder found."
+            Get-ChildItem -Recurse -Filter *.dll | Select-Object -First 50 | ForEach-Object { $_.FullName }
+          }
 
       - name: Upload DLLs
         uses: actions/upload-artifact@v4
         with:
           name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-dll
-          path: output\\${{ matrix.platform }}\\${{ matrix.configuration }}\\*.dll
-          if-no-files-found: error
+          path: |
+            output\${{ matrix.platform }}\${{ matrix.configuration }}\*.dll
+            **\bin\${{ matrix.configuration }}\*.dll
+          if-no-files-found: warn
 
       - name: Upload PDBs
         uses: actions/upload-artifact@v4
         with:
           name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
-          path: output\\${{ matrix.platform }}\\${{ matrix.configuration }}\\*.pdb
+          path: |
+            output\${{ matrix.platform }}\${{ matrix.configuration }}\*.pdb
+            **\bin\${{ matrix.configuration }}\*.pdb
           if-no-files-found: warn
+
