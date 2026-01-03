@@ -1,53 +1,92 @@
-name: MSBuild
+name: Build
 
 on:
   push:
-    branches: ["master"]
+    branches: ['master']
   pull_request:
-    branches: ["master"]
+    branches: ['master']
 
 jobs:
-  msbuild:
+  build:
     runs-on: windows-latest
-
     strategy:
       fail-fast: false
       matrix:
         configuration: [Release, ReleaseAVX2, ReleaseFreetype, ReleaseFreetypeAVX2, ReleaseTextmode, ReleaseTextmodeAVX2]
         platform: [x64]
 
+    env:
+      SOLUTION_FILE: Amalgam.sln   # Change if your solution file is elsewhere
+
     steps:
-    - name: Checkout
+    - name: Checkout repository
       uses: actions/checkout@v4
       with:
         submodules: recursive
 
+    - name: Detect project type
+      id: detect-type
+      shell: bash
+      run: |
+        echo "Detecting if the project uses the .NET SDK..."
+        sdkprojects=$(find . -maxdepth 3 -name '*.csproj' -print0 | xargs -0 grep -l '<Project Sdk=' || true)
+        if [ -n "$sdkprojects" ]; then
+          echo "isSdk=true" >> $GITHUB_OUTPUT
+        else
+          echo "isSdk=false" >> $GITHUB_OUTPUT
+        fi
+
     - name: Setup MSBuild
+      if: steps.detect-type.outputs.isSdk != 'true'
       uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '17.0'    # Adjust if needed
+
+    - name: Setup .NET
+      if: steps.detect-type.outputs.isSdk == 'true'
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '6.0.x'    # Adjust if needed
 
     - name: Setup NuGet
+      if: steps.detect-type.outputs.isSdk != 'true'
       uses: NuGet/setup-nuget@v2
 
-    # CRITICAL FIX: Explicitly restore packages before building
-    - name: Restore NuGet packages
-      run: nuget restore Amalgam.sln
+    - name: Cache NuGet packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.nuget/packages
+        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.sln') }}
+        restore-keys: nuget-${{ runner.os }}
 
-    - name: Build
-      run: |
-        msbuild Amalgam.sln /m /p:Platform=${{ matrix.platform }} /p:Configuration=${{ matrix.configuration }} /verbosity:minimal
+    - name: Restore packages (.NET SDK)
+      if: steps.detect-type.outputs.isSdk == 'true'
+      run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+    - name: Restore packages (MSBuild)
+      if: steps.detect-type.outputs.isSdk != 'true'
+      run: nuget restore ${{ env.SOLUTION_FILE }}
+
+    - name: Build (.NET SDK)
+      if: steps.detect-type.outputs.isSdk == 'true'
+      run: dotnet build ${{ env.SOLUTION_FILE }} --configuration ${{ matrix.configuration }} --runtime win-${{ matrix.platform }} -v:m
+
+    - name: Build (MSBuild)
+      if: steps.detect-type.outputs.isSdk != 'true'
+      run: msbuild ${{ env.SOLUTION_FILE }} /m /p:Platform=${{ matrix.platform }} /p:Configuration=${{ matrix.configuration }} /verbosity:detailed
 
     - name: Upload DLLs
       uses: actions/upload-artifact@v4
       with:
-        name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-dll
+        name: Build-${{ matrix.platform }}-${{ matrix.configuration }}-dll
         path: |
-          Amalgam/x64/${{ matrix.configuration }}/*.dll
+          **/${{ matrix.configuration }}/*.dll
         if-no-files-found: warn
 
     - name: Upload PDBs
       uses: actions/upload-artifact@v4
       with:
-        name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
+        name: Build-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
         path: |
-          Amalgam/x64/${{ matrix.configuration }}/*.pdb
+          **/${{ matrix.configuration }}/*.pdb
         if-no-files-found: warn
