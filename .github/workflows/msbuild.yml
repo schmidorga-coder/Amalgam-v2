@@ -16,98 +16,38 @@ jobs:
         configuration: [Release, ReleaseAVX2, ReleaseFreetype, ReleaseFreetypeAVX2, ReleaseTextmode, ReleaseTextmodeAVX2]
         platform: [x64]
 
-    defaults:
-      run:
-        shell: pwsh
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
 
-      - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v2
 
-      - name: Resolve solution path
-        run: |
-          if (Test-Path ".\Amalgam.sln") {
-            "SOLUTION_PATH=.\Amalgam.sln" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } else {
-            $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1
-            if (-not $sln) { throw "No .sln found in repo." }
-            "SOLUTION_PATH=$($sln.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-          Write-Host "Using solution: $env:SOLUTION_PATH"
+    # CRITICAL FIX: Explicitly restore packages before building
+    - name: Restore NuGet packages
+      run: nuget restore Amalgam.sln
 
-      - name: Check solution has this Configuration|Platform
-        id: combo
-        run: |
-          $sln = Get-Content "$env:SOLUTION_PATH" -Raw
-          $m = [regex]::Match(
-            $sln,
-            'GlobalSection\(SolutionConfigurationPlatforms\)\s*=\s*preSolution(.*?)EndGlobalSection',
-            [System.Text.RegularExpressions.RegexOptions]::Singleline
-          )
-          if (-not $m.Success) { throw "Could not find SolutionConfigurationPlatforms section in the .sln" }
+    - name: Build
+      run: |
+        msbuild Amalgam.sln /m /p:Platform=${{ matrix.platform }} /p:Configuration=${{ matrix.configuration }} /verbosity:minimal
 
-          $lines = $m.Groups[1].Value -split "`r?`n"
-          $pairs = @()
-          foreach ($l in $lines) {
-            if ($l -match '^\s*([^=]+?)\s*=') { $pairs += $Matches[1].Trim() }
-          }
+    - name: Upload DLLs
+      uses: actions/upload-artifact@v4
+      with:
+        name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-dll
+        path: |
+          Amalgam/x64/${{ matrix.configuration }}/*.dll
+        if-no-files-found: warn
 
-          $wanted = "${{ matrix.configuration }}|${{ matrix.platform }}"
-          $exists = $pairs -contains $wanted
-
-          "exists=$($exists.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          Write-Host "Available solution configs (first 50):"
-          $pairs | Select-Object -First 50 | ForEach-Object { Write-Host "  $_" }
-          Write-Host "Wanted: $wanted"
-          if (-not $exists) { Write-Host "Skipping build: combo not defined in solution." }
-
-      - name: Restore NuGet packages
-        if: steps.combo.outputs.exists == 'true'
-        run: |
-          nuget restore "$env:SOLUTION_PATH" -NonInteractive
-
-      - name: Build
-        if: steps.combo.outputs.exists == 'true'
-        run: |
-          msbuild "$env:SOLUTION_PATH" /m `
-            /p:Platform=${{ matrix.platform }} `
-            /p:Configuration=${{ matrix.configuration }} `
-            /verbosity:minimal `
-            /bl:msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
-
-      - name: Upload MSBuild binlog (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: msbuild-binlog-${{ matrix.platform }}-${{ matrix.configuration }}
-          path: msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
-          if-no-files-found: ignore
-
-      - name: Upload DLLs
-        if: steps.combo.outputs.exists == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-dll
-          path: |
-            output\${{ matrix.platform }}\${{ matrix.configuration }}\*.dll
-            **\bin\${{ matrix.configuration }}\*.dll
-          if-no-files-found: warn
-
-      - name: Upload PDBs
-        if: steps.combo.outputs.exists == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
-          path: |
-            output\${{ matrix.platform }}\${{ matrix.configuration }}\*.pdb
-            **\bin\${{ matrix.configuration }}\*.pdb
-          if-no-files-found: warn
+    - name: Upload PDBs
+      uses: actions/upload-artifact@v4
+      with:
+        name: Amalgam-${{ matrix.platform }}-${{ matrix.configuration }}-pdb
+        path: |
+          Amalgam/x64/${{ matrix.configuration }}/*.pdb
+        if-no-files-found: warn
