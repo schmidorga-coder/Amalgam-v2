@@ -1,167 +1,276 @@
 #include "Memory.h"
+
 #include <format>
 #include <Psapi.h>
 #include <Zydis/Zydis.h>
-#include <optional>
 
-// Fast hex char to byte conversion
-static constexpr uint8_t HexToByte(char c)
+std::vector<byte> CMemory::PatternToByte(const char* szPattern)
 {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return 0;
+	std::vector<byte> vPattern = {};
+
+	const auto pStart = const_cast<char*>(szPattern);
+	const auto pEnd = const_cast<char*>(szPattern) + strlen(szPattern);
+	for (char* pCurrent = pStart; pCurrent < pEnd; ++pCurrent)
+		vPattern.push_back(byte(std::strtoul(pCurrent, &pCurrent, 16)));
+
+	return vPattern;
 }
 
-// Optimized pattern parser
-// Returns vector of {byte, is_wildcard}
-static std::vector<std::pair<uint8_t, bool>> ParsePattern(const char* szPattern)
+std::vector<int> CMemory::PatternToInt(const char* szPattern)
 {
-    std::vector<std::pair<uint8_t, bool>> result;
-    result.reserve(strlen(szPattern) / 2);
+	std::vector<int> vPattern = {};
 
-    for (const char* pCurrent = szPattern; *pCurrent; ++pCurrent)
-    {
-        if (*pCurrent == ' ') continue;
+	const auto pStart = const_cast<char*>(szPattern);
+	const auto pEnd = const_cast<char*>(szPattern) + strlen(szPattern);
+	for (char* pCurrent = pStart; pCurrent < pEnd; ++pCurrent)
+	{
+		if (*pCurrent == '?') // Is current byte a wildcard? Simply ignore that that byte later
+		{
+			++pCurrent;
+			if (*pCurrent == '?') // Check if following byte is also a wildcard
+				++pCurrent;
 
-        if (*pCurrent == '?')
-        {
-            result.emplace_back(0, true);
-            if (*(pCurrent + 1) == '?') pCurrent++; // Handle ??
-        }
-        else
-        {
-            uint8_t byte = (HexToByte(*pCurrent) << 4) | HexToByte(*(pCurrent + 1));
-            result.emplace_back(byte, false);
-            pCurrent++;
-        }
-    }
-    return result;
+			vPattern.push_back(-1);
+		}
+		else
+			vPattern.push_back(std::strtoul(pCurrent, &pCurrent, 16));
+	}
+
+	return vPattern;
 }
 
 uintptr_t CMemory::FindSignature(const char* szModule, const char* szPattern)
 {
-    const auto hModule = GetModuleHandleA(szModule);
-    if (!hModule) return 0x0;
+	if (const auto hModule = GetModuleHandle(szModule))
+	{
+		// Get module information to search in the given module
+		MODULEINFO lpModuleInfo;
+		if (!GetModuleInformation(GetCurrentProcess(), hModule, &lpModuleInfo, sizeof(MODULEINFO)))
+			return 0x0;
 
-    MODULEINFO lpModuleInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hModule, &lpModuleInfo, sizeof(MODULEINFO)))
-        return 0x0;
+		// The region where we will search for the byte sequence
+		const auto dwImageSize = lpModuleInfo.SizeOfImage;
 
-    const auto dwImageSize = lpModuleInfo.SizeOfImage;
-    if (!dwImageSize) return 0x0;
+		// Check if the image is faulty
+		if (!dwImageSize)
+			return 0x0;
 
-    const auto vPattern = ParsePattern(szPattern);
-    const byte* pImageBytes = reinterpret_cast<byte*>(hModule);
-    const size_t patternSize = vPattern.size();
+		// Convert IDA-Style signature to a byte sequence
+		const auto vPattern = PatternToInt(szPattern);
+		const auto iPatternSize = vPattern.size();
+		const int* iPatternBytes = vPattern.data();
 
-    // Simple implementation - For production AVX2 is recommended for large scans
-    for (size_t i = 0; i < dwImageSize - patternSize; ++i)
-    {
-        bool bFound = true;
-        for (size_t j = 0; j < patternSize; ++j)
-        {
-            if (!vPattern[j].second && pImageBytes[i + j] != vPattern[j].first)
-            {
-                bFound = false;
-                break;
-            }
-        }
-        if (bFound)
-            return uintptr_t(&pImageBytes[i]);
-    }
+		const auto pImageBytes = reinterpret_cast<byte*>(hModule);
 
-    return 0x0;
+		// Now loop through all bytes and check if the byte sequence matches
+		for (auto i = 0ul; i < dwImageSize - iPatternSize; ++i)
+		{
+			auto bFound = true;
+
+			// Go through all bytes from the signature and check if it matches
+			for (auto j = 0ul; j < iPatternSize; ++j)
+			{
+				if (pImageBytes[i + j] != iPatternBytes[j] // Bytes don't match
+					&& iPatternBytes[j] != -1)             // Byte isn't a wildcard either
+				{
+					bFound = false;
+					break;
+				}
+			}
+
+			if (bFound)
+				return uintptr_t(&pImageBytes[i]);
+		}
+
+		return 0x0;
+	}
+
+	return 0x0;
 }
 
 std::string CMemory::GetModuleName(uintptr_t uAddress)
 {
-    HMODULE hModule;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCSTR)uAddress, &hModule))
-    {
-        char cModuleName[MAX_PATH];
-        if (GetModuleBaseNameA(GetCurrentProcess(), hModule, cModuleName, MAX_PATH))
-            return cModuleName;
-    }
-    return "Unknown";
+	HMODULE hModule;
+	char cModuleName[MAX_PATH];
+
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		(LPCSTR)uAddress, &hModule))
+	{
+		GetModuleBaseNameA(GetCurrentProcess(), hModule, cModuleName, MAX_PATH);
+		return cModuleName;
+	}
+
+	return "Unknown";
 }
 
-// ... (Rest of FindSignatureAtAddress can utilize ParsePattern for optimization)
+uintptr_t CMemory::FindSignatureAtAddress(uintptr_t uAddress, const char* szPattern, uintptr_t uSkipAddress, bool* bRetFound)
+{
+	if (const auto hMod = GetModuleHandleA(GetModuleName(uAddress).c_str()))
+	{
+		// Get module information to search in the given module
+		MODULEINFO lpModuleInfo;
+		if (!GetModuleInformation(GetCurrentProcess(), hMod, &lpModuleInfo, sizeof(MODULEINFO)))
+			return 0x0;
+
+		// The region where we will search for the byte sequence
+		auto dwImageSize = lpModuleInfo.SizeOfImage;
+
+		// Check if the image is faulty
+		if (!dwImageSize)
+			return 0x0;
+
+		DWORD dwSubtract = uAddress - reinterpret_cast<uintptr_t>(hMod);
+		dwImageSize -= dwSubtract;
+
+		// Convert IDA-Style signature to a byte sequence
+		const auto vPattern = PatternToInt(szPattern);
+		const auto iPatternSize = vPattern.size();
+		const int* iPatternBytes = vPattern.data();
+
+		const auto pImageBytes = reinterpret_cast<byte*>(uAddress);
+		// Now loop through all bytes and check if the byte sequence matches
+
+		for (auto i = 0ul; i < dwImageSize - iPatternSize; ++i)
+		{
+			auto bFound = true;
+
+			// Go through all bytes from the signature and check if it matches
+			for (auto j = 0ul; j < iPatternSize; ++j)
+			{
+				if (pImageBytes[i + j] != iPatternBytes[j] // Bytes don't match
+					&& iPatternBytes[j] != -1)             // Byte isn't a wildcard either
+				{
+					bFound = false;
+					break;
+				}
+			}
+
+			if (uSkipAddress && uSkipAddress == uintptr_t(&pImageBytes[i]))
+			{
+				if (bRetFound)
+					*bRetFound = bFound;
+				continue;
+			}
+
+			if (bFound)
+				return uintptr_t(&pImageBytes[i]);
+		}
+
+		return 0x0;
+	}
+
+	return 0x0;
+}
+
+using CreateInterfaceFn = void*(*)(const char* pName, int* pReturnCode);
+
+PVOID CMemory::FindInterface(const char* szModule, const char* szObject)
+{
+	const auto CreateInterface = GetModuleExport<CreateInterfaceFn>(szModule, "CreateInterface");
+	return CreateInterface(szObject, nullptr);
+}
+
+std::string CMemory::GetModuleOffset(uintptr_t uAddress)
+{
+	HMODULE hModule;
+	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LPCSTR(uAddress), &hModule))
+		return std::format("{:#x}", uAddress);
+
+	uintptr_t uBase = uintptr_t(hModule);
+	if (char buffer[MAX_PATH]; GetModuleBaseName(GetCurrentProcess(), hModule, buffer, sizeof(buffer) / sizeof(char)))
+		return std::format("{}+{:#x}", buffer, uAddress - uBase);
+
+	return std::format("{:#x}+{:#x}", uBase, uAddress - uBase);
+}
 
 // AI failed me so i had to learn this shit by myself
-// Optimized Zydis signature generation
+// Some parts were taken from IDA-Fusion plugin
 std::string CMemory::GenerateSignatureAtAddress(uintptr_t uAddress, size_t maxLength)
 {
-    std::string sPattern;
-    std::string sModule = GetModuleName(uAddress);
-    
-    HMODULE hMod = GetModuleHandleA(sModule.c_str());
-    if (!hMod) return {};
+	// byte, iswildcar
+	std::vector<std::pair<byte, bool>> vBytes;
+	std::string sPattern;
+	std::string sModule = GetModuleName(uAddress);
 
-    MODULEINFO lpModuleInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hMod, &lpModuleInfo, sizeof(MODULEINFO))) return {};
-    
-    uintptr_t uMinAddr = (uintptr_t)hMod;
-    uintptr_t uMaxAddr = uMinAddr + lpModuleInfo.SizeOfImage;
+	uintptr_t uMinAddr, uMaxAddr;
+	if (const auto hMod = GetModuleHandleA(sModule.c_str()))
+	{
+		uMinAddr = (uintptr_t)hMod;
 
-    ZydisDecoder tDecoder;
-    if (ZYAN_FAILED(ZydisDecoderInit(&tDecoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
-        return {};
+		MODULEINFO lpModuleInfo;
+		if (GetModuleInformation(GetCurrentProcess(), hMod, &lpModuleInfo, sizeof(MODULEINFO)) && lpModuleInfo.SizeOfImage)
+			uMaxAddr = uMinAddr + lpModuleInfo.SizeOfImage;
+	}
 
-    uintptr_t uLastFound = uMinAddr;
-    uintptr_t uCurrentAddr = uAddress;
-    
-    // Store bytes and wildcards
-    std::vector<std::pair<uint8_t, bool>> vSignatureBytes;
+	if (!uMaxAddr)
+		return {};
 
-    while (uCurrentAddr - uAddress < maxLength && uCurrentAddr < uMaxAddr)
-    {
-        ZydisDecodedInstruction tInstruction;
-        if (ZYAN_FAILED(ZydisDecoderDecodeInstruction(&tDecoder, nullptr, (void*)(uCurrentAddr), 15, &tInstruction)))
-            break;
+	ZydisDecoder tDecoder;
+	if (ZYAN_FAILED(ZydisDecoderInit(&tDecoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+		return {};
 
-        // Calculate offset for relative addressing to mask
-        // If an instruction has relative displacement, we usually want to wildcard those bytes
-        byte uOffset = tInstruction.raw.disp.offset + (tInstruction.raw.imm ? tInstruction.raw.imm->offset : 0);
-        
-        for (int i = 0; i < tInstruction.length; i++)
-        {
-            // Mask relative offsets (dynamic memory addresses)
-            bool isWildcard = (uOffset != 0 && i >= uOffset);
-            vSignatureBytes.push_back({ *(byte*)(uCurrentAddr + i), isWildcard });
-        }
+	uintptr_t uLastFound = uMinAddr;
+	uintptr_t uCurrentAddr = uAddress;
+	
+	while (uCurrentAddr - uAddress < maxLength && uCurrentAddr < uMaxAddr)
+	{
+		ZydisDecodedInstruction tInstruction;
+		if (ZYAN_FAILED(ZydisDecoderDecodeInstruction(&tDecoder, nullptr, (void*)(uCurrentAddr), 15,
+			&tInstruction)))
+			break;
 
-        // Construct string pattern for verification
-        std::string sTempPattern;
-        for (const auto& [val, wildcard] : vSignatureBytes)
-            sTempPattern.append(wildcard ? "? " : std::format("{:02X} ", val));
-        
-        if (!sTempPattern.empty()) sTempPattern.pop_back();
+		// Works
+		byte uOffset = tInstruction.raw.disp.offset + tInstruction.raw.imm->offset;
+		for (int i = 0; i < tInstruction.length; i++)
+			vBytes.push_back({ *(byte*)(uCurrentAddr + i), uOffset && i >= uOffset });
 
-        // Verify uniqueness
-        bool bFoundAtCurrent = false;
-        FindSignatureAtAddress(uAddress, sTempPattern.c_str(), uAddress, &bFoundAtCurrent);
+		// Attempt to search for this signature, if nothing is found then we have a unique signature
+		{
+			std::string sTempPattern;
+			sPattern.clear();
 
-        if (bFoundAtCurrent)
-        {
-            // Check if it exists elsewhere
-            uintptr_t uFound = FindSignatureAtAddress(uLastFound, sTempPattern.c_str(), uAddress);
-            if (!uFound) {
-                // Unique!
-                sPattern = sTempPattern;
-                break;
-            }
-            uLastFound = uFound; // Optimization: Skip past what we already found
-        }
-        else {
-            break; // Should not happen if logic is correct
-        }
+			for (auto [uByte, bWildcard] : vBytes)
+			{
+				if (bWildcard)
+					sTempPattern.append("? ");
+				else
+					sTempPattern.append(std::format("{:02X} ", uByte));
+			}
+			sTempPattern.pop_back();
 
-        uCurrentAddr += tInstruction.length;
-    }
+			// Try to find it at original address
+			bool bFoundAtCurrent = false;
+			FindSignatureAtAddress(uAddress, sTempPattern.c_str(), uAddress, &bFoundAtCurrent);
 
-    return sPattern;
+			uintptr_t uFound = FindSignatureAtAddress(uLastFound, sTempPattern.c_str(), uAddress);
+			if (bFoundAtCurrent && !uFound)
+			{
+				sPattern = sTempPattern;
+				break;
+			}
+			// Failsafe in case we can no longer find it at the original address
+			else if (!bFoundAtCurrent)
+				break;
+
+			sPattern = std::format("Not a unique signature ({})", sTempPattern);
+
+			// Update the last found address so we dont have to scan that region anymore
+			uLastFound = uFound;
+		}
+
+		uCurrentAddr += tInstruction.length;
+	}
+
+	return sPattern;
 }
 
-// ... rest of file ...
+uintptr_t CMemory::GetOffsetFromBase(uintptr_t uAddress)
+{
+	HMODULE hModule;
+	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LPCSTR(uAddress), &hModule))
+		return -1;
+
+	uintptr_t uBase = uintptr_t(hModule);
+	return uAddress - uBase;
+}
