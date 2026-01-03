@@ -7,516 +7,857 @@
 #include "../Misc/NamedPipe/NamedPipe.h"
 #include "../Ticks/Ticks.h"
 
-// Constants for clearer logic
-constexpr float MAX_TRACKING_DIST = 1500.0f;
-constexpr float MELEE_RANGE = 200.0f;
-constexpr float FLAMETHROWER_RANGE = 550.0f;
-constexpr float MEDIGUN_RANGE = 450.0f;
-
 static bool SmoothAimHasPriority()
 {
-    const auto iAimType = Vars::Aimbot::General::AimType.Value;
-    // If aimbot is off or set to specific modes that don't require steering override
-    if (iAimType != Vars::Aimbot::General::AimTypeEnum::Smooth &&
-        iAimType != Vars::Aimbot::General::AimTypeEnum::Assistive)
-        return false;
+	const auto iAimType = Vars::Aimbot::General::AimType.Value;
+	if (iAimType != Vars::Aimbot::General::AimTypeEnum::Smooth &&
+		iAimType != Vars::Aimbot::General::AimTypeEnum::Assistive)
+		return false;
 
-    return G::AimbotSteering;
+	return G::AimbotSteering;
 }
 
 bool CBotUtils::HasMedigunTargets(CTFPlayer* pLocal, CTFWeaponBase* pWeapon)
 {
-    if (!Vars::Aimbot::Healing::AutoHeal.Value || !pWeapon)
-        return false;
+	if (!Vars::Aimbot::Healing::AutoHeal.Value)
+		return false;
 
-    const Vec3 vShootPos = F::Ticks.GetShootPos();
-    const float flRange = MEDIGUN_RANGE; // Use constant or pWeapon->GetRange()
+	Vec3 vShootPos = F::Ticks.GetShootPos();
+	float flRange = pWeapon->GetRange();
+	for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerTeam))
+	{
+		if (pEntity->entindex() == pLocal->entindex() || vShootPos.DistTo(pEntity->GetCenter()) > flRange)
+			continue;
 
-    // Optimization: Don't iterate all entities, iterate teammates only
-    for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerTeam))
-    {
-        if (pEntity->entindex() == pLocal->entindex()) continue;
-        if (vShootPos.DistTo(pEntity->GetCenter()) > flRange) continue;
+		if (pEntity->As<CTFPlayer>()->InCond(TF_COND_STEALTHED) ||
+			(Vars::Aimbot::Healing::HealPriority.Value == Vars::Aimbot::Healing::HealPriorityEnum::FriendsOnly &&
+			!H::Entities.IsFriend(pEntity->entindex()) && !H::Entities.InParty(pEntity->entindex())))
+			continue;
 
-        auto pPlayer = pEntity->As<CTFPlayer>();
-        if (pPlayer->InCond(TF_COND_STEALTHED)) continue; // Don't heal stealthed spies
+		return true;
+	}
+	return false;
+}
 
-        // Handle Priority Logic
-        bool bIsFriend = H::Entities.IsFriend(pEntity->entindex()) || H::Entities.InParty(pEntity->entindex());
-        if (Vars::Aimbot::Healing::HealPriority.Value == Vars::Aimbot::Healing::HealPriorityEnum::FriendsOnly && !bIsFriend)
-            continue;
+bool CBotUtils::ShouldAssist(CTFPlayer* pLocal, int iEntIdx)
+{
+	auto pEntity = I::ClientEntityList->GetClientEntity(iEntIdx);
+	if (!pEntity || pEntity->As<CBaseEntity>()->m_iTeamNum() != pLocal->m_iTeamNum())
+		return false;
 
-        return true;
-    }
-    return false;
+	if (!(Vars::Misc::Movement::NavBot::Preferences.Value & Vars::Misc::Movement::NavBot::PreferencesEnum::HelpFriendlyCaptureObjectives))
+		return true;
+
+	if (F::PlayerUtils.IsIgnored(iEntIdx)
+		|| H::Entities.InParty(iEntIdx)
+		|| H::Entities.IsFriend(iEntIdx))
+		return true;
+
+	return false;
 }
 
 ShouldTargetEnum::ShouldTargetEnum CBotUtils::ShouldTarget(CTFPlayer* pLocal, CTFWeaponBase* pWeapon, int iEntIdx)
 {
-    auto pEntity = I::ClientEntityList->GetClientEntity(iEntIdx)->As<CBaseEntity>();
-    if (!pEntity || !pEntity->IsPlayer()) return ShouldTargetEnum::Invalid;
+	auto pEntity = I::ClientEntityList->GetClientEntity(iEntIdx)->As<CBaseEntity>();
+	if (!pEntity || !pEntity->IsPlayer())
+		return ShouldTargetEnum::Invalid;
 
-    auto pPlayer = pEntity->As<CTFPlayer>();
-    if (!pPlayer->IsAlive() || pPlayer == pLocal) return ShouldTargetEnum::Invalid;
-
-    // Team check
-    if (pPlayer->m_iTeamNum() == pLocal->m_iTeamNum()) return ShouldTargetEnum::DontTarget;
+	auto pPlayer = pEntity->As<CTFPlayer>();
+	if (!pPlayer->IsAlive() || pPlayer == pLocal)
+		return ShouldTargetEnum::Invalid;
 
 #ifdef TEXTMODE
-    // Skip local bots in textmode to prevent farming loops
-    if (auto pResource = H::Entities.GetResource()) {
-        if (F::NamedPipe.IsLocalBot(pResource->m_iAccountID(iEntIdx)) && 
-            !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::LocalBots))
-            return ShouldTargetEnum::DontTarget;
-    }
+	if (auto pResource = H::Entities.GetResource(); pResource && F::NamedPipe.IsLocalBot(pResource->m_iAccountID(iEntIdx)) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::LocalBots))
+		return ShouldTargetEnum::DontTarget;
 #endif
 
-    // --- Ignore Checks ---
-    // If we are bypassing ignores, skip this block
-    if (!(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Ignored))
-    {
-        if (F::PlayerUtils.IsIgnored(iEntIdx)) return ShouldTargetEnum::DontTarget;
-    }
+	if (F::PlayerUtils.IsIgnored(iEntIdx) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Ignored))
+		return ShouldTargetEnum::DontTarget;
 
-    // Consolidated Ignore Flags Logic
-    int ignoreFlags = Vars::Aimbot::General::Ignore.Value;
-    int bypassFlags = Vars::Aimbot::General::BypassIgnore.Value;
+	if (Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Friends && H::Entities.IsFriend(iEntIdx) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Friends)
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Party && H::Entities.InParty(iEntIdx) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Friends)
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Invulnerable && pPlayer->IsInvulnerable() && G::SavedDefIndexes[SLOT_MELEE] != Heavy_t_TheHolidayPunch
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Invisible && pPlayer->m_flInvisibility() && pPlayer->m_flInvisibility() >= Vars::Aimbot::General::IgnoreInvisible.Value / 100.f
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::DeadRinger && pPlayer->m_bFeignDeathReady()
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Taunting && pPlayer->IsTaunting()
+		|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Disguised && pPlayer->InCond(TF_COND_DISGUISED))
+		return ShouldTargetEnum::DontTarget;
 
-    bool bIsFriend = H::Entities.IsFriend(iEntIdx);
-    bool bInParty = H::Entities.InParty(iEntIdx);
+	if (pPlayer->m_iTeamNum() == pLocal->m_iTeamNum())
+		return ShouldTargetEnum::DontTarget;
 
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Friends) && bIsFriend && !(bypassFlags & Vars::Aimbot::General::BypassIgnoreEnum::Friends)) return ShouldTargetEnum::DontTarget;
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Party) && bInParty && !(bypassFlags & Vars::Aimbot::General::BypassIgnoreEnum::Friends)) return ShouldTargetEnum::DontTarget;
-    
-    // Condition checks (Invuln, Cloak, Dead Ringer, Taunt)
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Invulnerable) && pPlayer->IsInvulnerable() && G::SavedDefIndexes[SLOT_MELEE] != Heavy_t_TheHolidayPunch) return ShouldTargetEnum::DontTarget;
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Taunting) && pPlayer->IsTaunting()) return ShouldTargetEnum::DontTarget;
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Disguised) && pPlayer->InCond(TF_COND_DISGUISED)) return ShouldTargetEnum::DontTarget;
-    
-    // Cloak handling with threshold
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Invisible) && pPlayer->m_flInvisibility() >= (Vars::Aimbot::General::IgnoreInvisible.Value / 100.f)) return ShouldTargetEnum::DontTarget;
-    if ((ignoreFlags & Vars::Aimbot::General::IgnoreEnum::DeadRinger) && pPlayer->m_bFeignDeathReady()) return ShouldTargetEnum::DontTarget;
+	if (Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Vaccinator)
+	{
+		switch (SDK::GetWeaponType(pWeapon))
+		{
+		case EWeaponType::HITSCAN:
+			if (pPlayer->InCond(TF_COND_MEDIGUN_UBER_BULLET_RESIST) && SDK::AttribHookValue(0, "mod_pierce_resists_absorbs", pWeapon) != 0)
+				return ShouldTargetEnum::DontTarget;
+			break;
+		case EWeaponType::PROJECTILE:
+			if (pPlayer->InCond(TF_COND_MEDIGUN_UBER_FIRE_RESIST) && (G::SavedWepIds[SLOT_PRIMARY] == TF_WEAPON_FLAMETHROWER && G::SavedWepIds[SLOT_SECONDARY] == TF_WEAPON_FLAREGUN))
+				return ShouldTargetEnum::DontTarget;
+			else if (pPlayer->InCond(TF_COND_MEDIGUN_UBER_BULLET_RESIST) && G::SavedWepIds[SLOT_PRIMARY] == TF_WEAPON_COMPOUND_BOW)
+				return ShouldTargetEnum::DontTarget;
+			else if (pPlayer->InCond(TF_COND_MEDIGUN_UBER_BLAST_RESIST))
+				return ShouldTargetEnum::DontTarget;
+		}
+	}
 
-    // Vaccinator Logic (Refactored for readability)
-    if (ignoreFlags & Vars::Aimbot::General::IgnoreEnum::Vaccinator)
-    {
-        bool bResistBullet = pPlayer->InCond(TF_COND_MEDIGUN_UBER_BULLET_RESIST);
-        bool bResistFire = pPlayer->InCond(TF_COND_MEDIGUN_UBER_FIRE_RESIST);
-        bool bResistExplo = pPlayer->InCond(TF_COND_MEDIGUN_UBER_BLAST_RESIST);
-
-        switch (SDK::GetWeaponType(pWeapon))
-        {
-        case EWeaponType::HITSCAN:
-            // Check if weapon can pierce resist (e.g. Enforcer)
-            if (bResistBullet && SDK::AttribHookValue(0, "mod_pierce_resists_absorbs", pWeapon) == 0) 
-                return ShouldTargetEnum::DontTarget;
-            break;
-        case EWeaponType::PROJECTILE:
-            if (bResistFire && (G::SavedWepIds[SLOT_PRIMARY] == TF_WEAPON_FLAMETHROWER)) return ShouldTargetEnum::DontTarget;
-            if (bResistExplo) return ShouldTargetEnum::DontTarget; // Generalize blast resist ignoring
-            if (bResistBullet && G::SavedWepIds[SLOT_PRIMARY] == TF_WEAPON_COMPOUND_BOW) return ShouldTargetEnum::DontTarget; // Bows are projectiles but deal bullet dmg type
-            break;
-        }
-    }
-
-    return ShouldTargetEnum::Target;
+	return ShouldTargetEnum::Target;
 }
 
 ShouldTargetEnum::ShouldTargetEnum CBotUtils::ShouldTargetBuilding(CTFPlayer* pLocal, int iEntIdx)
 {
-    if (iEntIdx <= 0) return ShouldTargetEnum::DontTarget;
+	if (iEntIdx <= 0)
+		return ShouldTargetEnum::DontTarget;
 
-    auto pEntity = I::ClientEntityList->GetClientEntity(iEntIdx)->As<CBaseEntity>();
-    if (!pEntity || !pEntity->IsBuilding()) return ShouldTargetEnum::DontTarget;
+	auto pEntity = I::ClientEntityList->GetClientEntity(iEntIdx)->As<CBaseEntity>();
+	if (!pEntity)
+		return ShouldTargetEnum::Invalid;
 
-    auto pBuilding = pEntity->As<CBaseObject>();
-    if (pBuilding->m_iHealth() <= 0 || pBuilding->IsDormant()) return ShouldTargetEnum::DontTarget;
-    if (pBuilding->m_iTeamNum() == pLocal->m_iTeamNum()) return ShouldTargetEnum::DontTarget; // Friendly building
+	if (!pEntity->IsBuilding())
+		return ShouldTargetEnum::DontTarget;
 
-    // Type Filters
-    int targetFlags = Vars::Aimbot::General::Target.Value;
-    if (!(targetFlags & Vars::Aimbot::General::TargetEnum::Sentry) && pBuilding->IsSentrygun()) return ShouldTargetEnum::DontTarget;
-    if (!(targetFlags & Vars::Aimbot::General::TargetEnum::Dispenser) && pBuilding->IsDispenser()) return ShouldTargetEnum::DontTarget;
-    if (!(targetFlags & Vars::Aimbot::General::TargetEnum::Teleporter) && pBuilding->IsTeleporter()) return ShouldTargetEnum::DontTarget;
+	auto pBuilding = pEntity->As<CBaseObject>();
+	if (!(Vars::Aimbot::General::Target.Value & Vars::Aimbot::General::TargetEnum::Sentry) && pBuilding->IsSentrygun()
+		|| !(Vars::Aimbot::General::Target.Value & Vars::Aimbot::General::TargetEnum::Dispenser) && pBuilding->IsDispenser()
+		|| !(Vars::Aimbot::General::Target.Value & Vars::Aimbot::General::TargetEnum::Teleporter) && pBuilding->IsTeleporter())
+		return ShouldTargetEnum::Target;
 
-    // Owner Checks (Ignore friends' buildings)
-    auto pOwner = pBuilding->m_hBuilder().Get();
-    if (pOwner)
-    {
-        if (F::PlayerUtils.IsIgnored(pOwner->entindex()) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Ignored))
-            return ShouldTargetEnum::DontTarget;
+	if (pLocal->m_iTeamNum() == pBuilding->m_iTeamNum())
+		return ShouldTargetEnum::Target;
 
-        if (H::Entities.IsFriend(pOwner->entindex()) || H::Entities.InParty(pOwner->entindex()))
-             if (!(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Friends))
-                return ShouldTargetEnum::DontTarget;
-    }
+	auto pOwner = pBuilding->m_hBuilder().Get();
+	if (pOwner)
+	{
+		if (F::PlayerUtils.IsIgnored(pOwner->entindex()) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Ignored))
+			return ShouldTargetEnum::DontTarget;
 
-    return ShouldTargetEnum::Target;
+		if (Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Friends && H::Entities.IsFriend(pOwner->entindex()) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Friends)
+			|| Vars::Aimbot::General::Ignore.Value & Vars::Aimbot::General::IgnoreEnum::Party && H::Entities.InParty(pOwner->entindex()) && !(Vars::Aimbot::General::BypassIgnore.Value & Vars::Aimbot::General::BypassIgnoreEnum::Friends))
+			return ShouldTargetEnum::DontTarget;
+	}
+
+	return ShouldTargetEnum::Target;
+}
+
+bool CBotUtils::GetDormantOrigin(int iIndex, Vector& vOut)
+{
+	if (iIndex <= 0)
+		return false;
+
+	auto pEntity = I::ClientEntityList->GetClientEntity(iIndex)->As<CBaseEntity>();
+	if (!pEntity ||
+		(pEntity->IsPlayer() ? !pEntity->As<CBasePlayer>()->IsAlive() :
+		pEntity->IsBuilding() ? !pEntity->As<CBaseObject>()->m_iHealth() : true))
+		return false;
+
+	if (!pEntity->IsDormant() || H::Entities.GetDormancy(iIndex))
+	{
+		vOut = pEntity->GetAbsOrigin();
+		return true;
+	}
+
+	return false;
 }
 
 ClosestEnemy_t CBotUtils::UpdateCloseEnemies(CTFPlayer* pLocal, CTFWeaponBase* pWeapon)
 {
-    m_vCloseEnemies.clear();
-    const Vector vLocalOrigin = pLocal->GetAbsOrigin();
+	m_vCloseEnemies.clear();
 
-    // Loop Players
-    for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
-    {
-        if (ShouldTarget(pLocal, pWeapon, pEntity->entindex()) == ShouldTargetEnum::DontTarget) continue;
+	for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
+	{
+		auto pPlayer = pEntity->As<CTFPlayer>();
+		int iEntIndex = pPlayer->entindex();
+		if (!ShouldTarget(pLocal, pWeapon, iEntIndex))
+			continue;
 
-        Vector vOrigin = pEntity->GetAbsOrigin();
-        // Handle dormancy positions
-        if (pEntity->IsDormant())
-        {
-            if (!H::Entities.GetDormancy(pEntity->entindex())) continue; // Not seen recently
-            // vOrigin is already updated by GetDormancy logic internally usually, or use cache
-        }
+		Vector vOrigin;
+		if (!GetDormantOrigin(iEntIndex, vOrigin))
+			continue;
 
-        float dist = vLocalOrigin.DistTo(vOrigin);
-        m_vCloseEnemies.emplace_back(pEntity->entindex(), pEntity->As<CTFPlayer>(), dist);
-    }
+		m_vCloseEnemies.emplace_back(iEntIndex, pPlayer, pLocal->GetAbsOrigin().DistTo(vOrigin));
+	}
+	
+	std::sort(m_vCloseEnemies.begin(), m_vCloseEnemies.end(), [](const ClosestEnemy_t& a, const ClosestEnemy_t& b) -> bool
+			  {
+				  return a.m_flDist < b.m_flDist;
+			  });
 
-    // Sort by distance (ASC)
-    std::sort(m_vCloseEnemies.begin(), m_vCloseEnemies.end(), [](const ClosestEnemy_t& a, const ClosestEnemy_t& b) {
-        return a.m_flDist < b.m_flDist;
-    });
+	if (m_vCloseEnemies.empty())
+		return {};
 
-    if (m_vCloseEnemies.empty()) return {};
-    return m_vCloseEnemies.front();
+	return m_vCloseEnemies.front();
 }
+
 
 void CBotUtils::UpdateBestSlot(CTFPlayer* pLocal)
 {
-    // If disabled or manual override, exit
-    if (!Vars::Misc::Movement::BotUtils::WeaponSlot.Value) { m_iBestSlot = -1; return; }
-    
-    // If set to specific slot (Primary/Secondary/Melee)
-    if (Vars::Misc::Movement::BotUtils::WeaponSlot.Value != Vars::Misc::Movement::BotUtils::WeaponSlotEnum::Best) {
-        m_iBestSlot = Vars::Misc::Movement::BotUtils::WeaponSlot.Value - 2;
-        return;
-    }
+	if (!Vars::Misc::Movement::BotUtils::WeaponSlot.Value)
+	{
+		m_iBestSlot = -1;
+		return;
+	}
 
-    // "Best" Logic
-    int iClass = pLocal->m_iClass();
-    float flDist = m_tClosestEnemy.m_flDist;
-    bool bHasEnemy = m_tClosestEnemy.m_pPlayer != nullptr;
+	if (Vars::Misc::Movement::BotUtils::WeaponSlot.Value != Vars::Misc::Movement::BotUtils::WeaponSlotEnum::Best)
+	{
+		m_iBestSlot = Vars::Misc::Movement::BotUtils::WeaponSlot.Value - 2;
+		return;
+	}
 
-    // Helper to check ammo
-    auto HasAmmo = [&](int slot) -> bool {
-        if (!G::AmmoInSlot[slot].m_bUsesAmmo) return true; // Melee or boots
-        return G::AmmoInSlot[slot].m_iClip > 0 || G::AmmoInSlot[slot].m_iReserve > 0;
-    };
-    
-    auto HasClip = [&](int slot) -> bool {
-        return !G::AmmoInSlot[slot].m_bUsesAmmo || G::AmmoInSlot[slot].m_iClip > 0;
-    };
+	switch (pLocal->m_iClass())
+	{
+	case TF_CLASS_SCOUT:
+	{
+		if ((!G::AmmoInSlot[SLOT_PRIMARY].m_iClip &&
+			(!G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo || !G::AmmoInSlot[SLOT_SECONDARY].m_iClip || G::AmmoInSlot[SLOT_SECONDARY].m_iReserve <= G::AmmoInSlot[SLOT_SECONDARY].m_iMaxReserve / 4)) &&
+			m_tClosestEnemy.m_flDist <= 200.f)
+			m_iBestSlot = SLOT_MELEE;
+		else if (G::AmmoInSlot[SLOT_PRIMARY].m_iClip && m_tClosestEnemy.m_flDist <= 800.f)
+			m_iBestSlot = SLOT_PRIMARY;
+		else if (G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo && G::AmmoInSlot[SLOT_SECONDARY].m_iClip)
+			m_iBestSlot = SLOT_SECONDARY;
+		break;
+	}
+	case TF_CLASS_HEAVY:
+	{
+		if (!G::AmmoInSlot[SLOT_PRIMARY].m_iClip && (!G::AmmoInSlot[SLOT_SECONDARY].m_iClip && G::AmmoInSlot[SLOT_SECONDARY].m_iReserve == 0) ||
+			(G::SavedDefIndexes[SLOT_MELEE] == Heavy_t_TheHolidayPunch && 
+			(m_tClosestEnemy.m_pPlayer && !m_tClosestEnemy.m_pPlayer->IsTaunting() && m_tClosestEnemy.m_pPlayer->IsInvulnerable()) && m_tClosestEnemy.m_flDist < 400.f))
+			m_iBestSlot = SLOT_MELEE;
+		else if ((!m_tClosestEnemy.m_pPlayer || m_tClosestEnemy.m_flDist <= 900.f) && G::AmmoInSlot[SLOT_PRIMARY].m_iClip)
+			m_iBestSlot = SLOT_PRIMARY;
+		else if (G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo && G::AmmoInSlot[SLOT_SECONDARY].m_iClip)
+			m_iBestSlot = SLOT_SECONDARY;
+		break;
+	}
+	case TF_CLASS_MEDIC:
+	{
+		auto pSecondaryWeapon = pLocal->GetWeaponFromSlot(SLOT_SECONDARY);
+		if (!pSecondaryWeapon)
+			return;
 
-    m_iBestSlot = SLOT_PRIMARY; // Default
-
-    switch (iClass)
-    {
-    case TF_CLASS_SCOUT:
-        if (!HasClip(SLOT_PRIMARY) && flDist < MELEE_RANGE) m_iBestSlot = SLOT_MELEE;
-        else if (!HasClip(SLOT_PRIMARY) && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY;
-        else if (flDist > 800.f && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY; // Pistol for range
-        break;
-
-    case TF_CLASS_HEAVY:
-        if (!HasClip(SLOT_PRIMARY))
-        {
-            if (HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY;
-            else m_iBestSlot = SLOT_MELEE;
-        }
-        else if (bHasEnemy && flDist < 150.f) m_iBestSlot = SLOT_MELEE; // Fists often better point blank if gun not revved
-        break;
-
-    case TF_CLASS_PYRO:
-        if (!HasClip(SLOT_PRIMARY) && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY;
-        else if (bHasEnemy && flDist > FLAMETHROWER_RANGE && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY; // Shotgun/Flare for range
-        break;
-
-    case TF_CLASS_MEDIC:
-    {
-        // Prioritize healing if teammates need it
-        auto pSec = pLocal->GetWeaponFromSlot(SLOT_SECONDARY);
-        if (pSec && (pSec->As<CWeaponMedigun>()->m_hHealingTarget() || HasMedigunTargets(pLocal, pSec)))
-            m_iBestSlot = SLOT_SECONDARY;
-        else if (bHasEnemy && flDist < MELEE_RANGE)
-            m_iBestSlot = SLOT_MELEE; // Ubersaw farming
-        else
-            m_iBestSlot = SLOT_PRIMARY; // Crossbow/Syringe
-        break;
-    }
-
-    case TF_CLASS_SNIPER:
-    {
-        // SMG Logic: If enemy is close or primary empty
-        bool bLowHP = pLocal->m_iHealth() < 50;
-        if (flDist < 300.f && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY;
-        else if (!HasClip(SLOT_PRIMARY) && HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_SECONDARY;
-        else if (flDist < MELEE_RANGE && !HasClip(SLOT_SECONDARY)) m_iBestSlot = SLOT_MELEE;
-        break;
-    }
-
-    case TF_CLASS_SOLDIER:
-    {
-        // Anti-Pyro logic
-        bool bEnemyIsPyro = bHasEnemy && m_tClosestEnemy.m_pPlayer->m_iClass() == TF_CLASS_PYRO;
-        if (bEnemyIsPyro && flDist < 500.f && HasClip(SLOT_SECONDARY)) 
-            m_iBestSlot = SLOT_SECONDARY; // Use Shotgun vs Pyro to avoid reflect
-        else if (!HasClip(SLOT_PRIMARY) && HasClip(SLOT_SECONDARY))
-            m_iBestSlot = SLOT_SECONDARY;
-        else if (!HasClip(SLOT_PRIMARY) && !HasClip(SLOT_SECONDARY))
-            m_iBestSlot = SLOT_MELEE;
-        break;
-    }
-    
-    // ... Implement other classes similarly ...
-    default:
-        // Generic fallback
-        if (!HasClip(SLOT_PRIMARY)) m_iBestSlot = SLOT_SECONDARY;
-        if (!HasClip(SLOT_SECONDARY) && !HasClip(SLOT_PRIMARY)) m_iBestSlot = SLOT_MELEE;
-        break;
-    }
+		if (pSecondaryWeapon->As<CWeaponMedigun>()->m_hHealingTarget() || HasMedigunTargets(pLocal, pSecondaryWeapon))
+			m_iBestSlot = SLOT_SECONDARY;
+		else if (!G::AmmoInSlot[SLOT_PRIMARY].m_iClip || (m_tClosestEnemy.m_flDist <= 400.f && m_tClosestEnemy.m_pPlayer))
+			m_iBestSlot = SLOT_MELEE;
+		else
+			m_iBestSlot = SLOT_PRIMARY;
+		break;
+	}
+	case TF_CLASS_SPY:
+	{
+		if (m_tClosestEnemy.m_flDist <= 250.f && m_tClosestEnemy.m_pPlayer)
+			m_iBestSlot = SLOT_MELEE;
+		else if (G::AmmoInSlot[SLOT_PRIMARY].m_iClip || G::AmmoInSlot[SLOT_PRIMARY].m_iReserve)
+			m_iBestSlot = SLOT_PRIMARY;
+		break;
+	}
+	case TF_CLASS_SNIPER:
+	{
+		int iPlayerLowHp = m_tClosestEnemy.m_pPlayer ? (m_tClosestEnemy.m_pPlayer->m_iHealth() < m_tClosestEnemy.m_pPlayer->GetMaxHealth() * 0.35f ? 2 : m_tClosestEnemy.m_pPlayer->m_iHealth() < m_tClosestEnemy.m_pPlayer->GetMaxHealth() * 0.75f) : -1;
+		if (!G::AmmoInSlot[SLOT_PRIMARY].m_iClip && !G::AmmoInSlot[SLOT_SECONDARY].m_iClip || (m_tClosestEnemy.m_flDist <= 200.f && m_tClosestEnemy.m_pPlayer))
+			m_iBestSlot = SLOT_MELEE;
+		else if (G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo && (G::AmmoInSlot[SLOT_SECONDARY].m_iClip || G::AmmoInSlot[SLOT_SECONDARY].m_iReserve) && (m_tClosestEnemy.m_flDist <= 300.f && iPlayerLowHp > 1))
+			m_iBestSlot = SLOT_SECONDARY;
+		// Keep currently selected weapon if the target we previosly tried shooting at is running away
+		else if (m_iCurrentSlot < 2 && m_iCurrentSlot != -1 && G::AmmoInSlot[m_iCurrentSlot].m_bUsesAmmo && G::AmmoInSlot[m_iCurrentSlot].m_iClip && (m_tClosestEnemy.m_flDist <= 800.f && iPlayerLowHp > 1))
+			break;
+		else if (G::AmmoInSlot[SLOT_PRIMARY].m_iClip)
+			m_iBestSlot = SLOT_PRIMARY;
+		break;
+	}
+	case TF_CLASS_PYRO:
+	{
+		if (!G::AmmoInSlot[SLOT_PRIMARY].m_iClip && (!G::AmmoInSlot[SLOT_SECONDARY].m_iClip && G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo &&
+			G::AmmoInSlot[SLOT_SECONDARY].m_iReserve <= G::AmmoInSlot[SLOT_SECONDARY].m_iMaxReserve / 4) &&
+			(m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist <= 300.f))
+			m_iBestSlot = SLOT_MELEE;
+		else if (G::AmmoInSlot[SLOT_PRIMARY].m_iClip && (m_tClosestEnemy.m_flDist <= 550.f || !m_tClosestEnemy.m_pPlayer))
+			m_iBestSlot = SLOT_PRIMARY;
+		else if (G::AmmoInSlot[SLOT_SECONDARY].m_iClip)
+			m_iBestSlot = SLOT_SECONDARY;
+		break;
+	}
+	case TF_CLASS_SOLDIER:
+	{
+		auto pEnemyWeapon = m_tClosestEnemy.m_pPlayer ? m_tClosestEnemy.m_pPlayer->m_hActiveWeapon().Get()->As<CTFWeaponBase>() : nullptr;
+		bool bEnemyCanAirblast = pEnemyWeapon && pEnemyWeapon->GetWeaponID() == TF_WEAPON_FLAMETHROWER && pEnemyWeapon->m_iItemDefinitionIndex() != Pyro_m_ThePhlogistinator;
+		bool bEnemyClose = m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist <= 250.f;
+		if ((m_iCurrentSlot != SLOT_PRIMARY || G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo && !G::AmmoInSlot[SLOT_PRIMARY].m_iClip && !G::AmmoInSlot[SLOT_PRIMARY].m_iReserve) && bEnemyClose && (m_tClosestEnemy.m_pPlayer->m_iHealth() < 80 ? !G::AmmoInSlot[SLOT_SECONDARY].m_iClip : m_tClosestEnemy.m_pPlayer->m_iHealth() >= 150 || G::AmmoInSlot[SLOT_SECONDARY].m_iClip < 2))
+			m_iBestSlot = SLOT_MELEE;
+		else if ((!G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo || G::AmmoInSlot[SLOT_SECONDARY].m_iClip) && (bEnemyCanAirblast || (m_tClosestEnemy.m_flDist <= 350.f && m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_pPlayer->m_iHealth() <= 125)))
+			m_iBestSlot = SLOT_SECONDARY;
+		else if (!G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo || G::AmmoInSlot[SLOT_PRIMARY].m_iClip)
+			m_iBestSlot = SLOT_PRIMARY;
+		break;
+	}
+	case TF_CLASS_DEMOMAN:
+	{
+		if (!G::AmmoInSlot[SLOT_PRIMARY].m_iClip && (!G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo || !G::AmmoInSlot[SLOT_SECONDARY].m_iClip) && (m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist <= 200.f))
+			m_iBestSlot = SLOT_MELEE;
+		else if (G::AmmoInSlot[SLOT_PRIMARY].m_iClip && (m_tClosestEnemy.m_flDist <= 800.f))
+			m_iBestSlot = SLOT_PRIMARY;
+		else if (G::AmmoInSlot[SLOT_SECONDARY].m_bUsesAmmo && (G::AmmoInSlot[SLOT_SECONDARY].m_iClip || G::AmmoInSlot[SLOT_SECONDARY].m_iReserve >= G::AmmoInSlot[SLOT_SECONDARY].m_iMaxReserve / 2))
+			m_iBestSlot = SLOT_SECONDARY;
+		break;
+	}
+	case TF_CLASS_ENGINEER:
+	{
+		if (G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo && !G::AmmoInSlot[SLOT_PRIMARY].m_iClip && !G::AmmoInSlot[SLOT_SECONDARY].m_iClip && (m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist <= 200.f))
+			m_iBestSlot = SLOT_MELEE;
+		else if ((!G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo || G::AmmoInSlot[SLOT_PRIMARY].m_iClip || G::AmmoInSlot[SLOT_PRIMARY].m_iReserve) && (m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist <= 500.f))
+			m_iBestSlot = SLOT_PRIMARY;
+		else if (!G::AmmoInSlot[SLOT_PRIMARY].m_bUsesAmmo || G::AmmoInSlot[SLOT_SECONDARY].m_iClip || G::AmmoInSlot[SLOT_SECONDARY].m_iReserve)
+			m_iBestSlot = SLOT_SECONDARY;
+		break;
+	}
+	default:
+		break;
+	}
 }
 
 void CBotUtils::SetSlot(CTFPlayer* pLocal, int iSlot)
 {
-    if (iSlot > -1 && m_iCurrentSlot != iSlot)
-    {
-        std::string sCommand = std::format("slot{}", iSlot + 1);
-        I::EngineClient->ClientCmd_Unrestricted(sCommand.c_str());
-        m_iCurrentSlot = iSlot; // Optimistic update
-    }
+	if (iSlot > -1)
+	{
+		auto sCommand = "slot" + std::to_string(iSlot+1);
+		if (m_iCurrentSlot != iSlot)
+			I::EngineClient->ClientCmd_Unrestricted(sCommand.c_str());
+	}
 }
-
-// --- Movement & Aim Utils ---
 
 void CBotUtils::DoSlowAim(Vec3& vWishAngles, float flSpeed, Vec3 vPreviousAngles)
 {
-    if (vPreviousAngles == vWishAngles) return;
+	// Yaw
+	if (vPreviousAngles.y != vWishAngles.y)
+	{
+		Vec3 vSlowDelta = vWishAngles - vPreviousAngles;
 
-    // Calculate delta and normalize
-    Vec3 vDelta = vWishAngles - vPreviousAngles;
-    Math::ClampAngles(vDelta);
+		while (vSlowDelta.y > 180)
+			vSlowDelta.y -= 360;
+		while (vSlowDelta.y < -180)
+			vSlowDelta.y += 360;
 
-    // Apply smoothing factor
-    // Higher flSpeed = slower movement (conceptually 1/Speed)
-    // If flSpeed is 0, instant snap (avoid div by 0)
-    if (flSpeed <= 0.1f) return; 
+		vSlowDelta /= flSpeed;
+		vWishAngles = vPreviousAngles + vSlowDelta;
 
-    vDelta /= flSpeed;
-    vWishAngles = vPreviousAngles + vDelta;
-    Math::ClampAngles(vWishAngles);
+		// Clamp as we changed angles
+		Math::ClampAngles(vWishAngles);
+	}
 }
 
-// 
-// This function creates a "human-like" idle movement using sine wave superposition
+void CBotUtils::LookAtPath(CUserCmd* pCmd, Vec2 vDest, Vec3 vLocalEyePos, bool bSilent)
+{
+	if (SmoothAimHasPriority())
+	{
+		m_vLastAngles = I::EngineClient->GetViewAngles();
+		return;
+	}
+
+	Vec3 vWishAng{ vDest.x, vDest.y, vLocalEyePos.z };
+	vWishAng = Math::CalcAngle(vLocalEyePos, vWishAng);
+
+	DoSlowAim(vWishAng, static_cast<float>(Vars::Misc::Movement::BotUtils::LookAtPathSpeed.Value), m_vLastAngles);
+	if (bSilent)
+		pCmd->viewangles = vWishAng;
+	else
+		I::EngineClient->SetViewAngles(vWishAng);
+	m_vLastAngles = vWishAng;
+}
+
+void CBotUtils::LookAtPath(CUserCmd* pCmd, Vec3 vWishAngles, Vec3 vLocalEyePos, bool bSilent, bool bSmooth)
+{
+	if (SmoothAimHasPriority())
+	{
+		m_vLastAngles = I::EngineClient->GetViewAngles();
+		return;
+	}
+
+	if (bSmooth)
+		DoSlowAim(vWishAngles, 25.f, m_vLastAngles);
+
+	if (bSilent)
+		pCmd->viewangles = vWishAngles;
+	else
+		I::EngineClient->SetViewAngles(vWishAngles);
+	m_vLastAngles = vWishAngles;
+}
+
 void CBotUtils::LookLegit(CTFPlayer* pLocal, CUserCmd* pCmd, const Vec3& vDest, bool bSilent)
 {
-    if (!pLocal || SmoothAimHasPriority()) {
-        m_vLastAngles = I::EngineClient->GetViewAngles();
-        // Reset legit state anchor to current to prevent snapping when toggling
-        m_tLLAP.m_vAnchor = m_vLastAngles; 
-        return;
-    }
+	if (!pLocal)
+		return;
 
-    Vec3 vEye = pLocal->GetEyePosition();
-    Vec3 vLookTarget = vDest;
-    bool bFocusingEnemy = false;
+	if (SmoothAimHasPriority())
+	{
+		Vec3 vCurrent = I::EngineClient->GetViewAngles();
+		m_vLastAngles = vCurrent;
+		auto& tState = m_tLLAP;
+		if (tState.m_bInitialized)
+			tState.m_vAnchor = vCurrent;
+		return;
+	}
 
-    // 1. Identify best thing to look at (Enemy > Building > Path)
-    // ... (Refined logic from original, but simplified) ...
-    // NOTE: In a real implementation, you might want to separate "GetBestViewTarget" into its own helper.
-    
-    // (Preserving original logic flow for brevity but cleaning it up)
-    CBaseEntity* pBestEntity = nullptr;
-    float flBestDist = FLT_MAX;
-    
-    // Optimized entity search (reuse m_vCloseEnemies if available?)
-    // For now, fast iteration:
-    for (const auto& enemy : m_vCloseEnemies) {
-        if (!enemy.m_pPlayer) continue;
-        if (SDK::VisPos(pLocal, enemy.m_pPlayer, vEye, enemy.m_pPlayer->GetEyePosition())) {
-            pBestEntity = enemy.m_pPlayer;
-            flBestDist = enemy.m_flDist;
-            bFocusingEnemy = true;
-            break; // Found closest visible
-        }
-    }
+	Vec3 vEye = pLocal->GetEyePosition();
+	Vec3 vLook = vDest;
+	bool bEnemyLock = false;
 
-    if (pBestEntity) {
-        vLookTarget = pBestEntity->As<CTFPlayer>()->GetEyePosition() - Vec3(0,0,10.f); // Look at chest
-    } else {
-        // Look at movement direction if no enemy
-        if (pLocal->m_vecVelocity().Length2D() > 10.f) {
-             Vec3 vVel = pLocal->m_vecVelocity();
-             vVel.Normalize();
-             vLookTarget = vEye + (vVel * 500.f); // Look ahead
-             vLookTarget.z = vEye.z; // Keep eye level mostly
-        }
-    }
+	// 1. look at visible enemies
+	static int iLastTarget = -1;
+	static float flLastSeen = 0.f;
+	static Vec3 vLastPos = {};
+	
+	CBaseEntity* pBestEnemy = nullptr;
+	float flBestDist = FLT_MAX;
+	auto pWeapon = pLocal->m_hActiveWeapon().Get()->As<CTFWeaponBase>();
 
-    // 2. Calculate Desired Angle
-    Vec3 vDesiredAngles = Math::CalcAngle(vEye, vLookTarget);
-    Math::ClampAngles(vDesiredAngles);
+	if (G::AimTarget.m_iEntIndex)
+	{
+		if (auto pTarget = I::ClientEntityList->GetClientEntity(G::AimTarget.m_iEntIndex)->As<CBaseEntity>())
+		{
+			pBestEnemy = pTarget;
+			flBestDist = -1.f;
+		}
+	}
 
-    // 3. Apply "Human" Jitter/Sway (The LLAP Logic)
-    auto& state = m_tLLAP;
-    if (!state.m_bInitialized) {
-        state = {}; // Reset
-        state.m_bInitialized = true;
-        state.m_vAnchor = I::EngineClient->GetViewAngles();
-    }
+	for (auto pEntity : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
+	{
+		auto pEnemy = pEntity->As<CTFPlayer>();
+		if (!pEnemy || !pEnemy->IsAlive() || pEnemy->IsDormant())
+			continue;
 
-    // Smoothly drag the "Anchor" towards the desired target
-    // This simulates the eyes/head tracking the main subject
-    float flTrackingSpeed = bFocusingEnemy ? 0.25f : 0.1f;
-    state.m_vAnchor = state.m_vAnchor.LerpAngle(vDesiredAngles, flTrackingSpeed);
+		if (ShouldTarget(pLocal, pWeapon, pEnemy->entindex()) == ShouldTargetEnum::DontTarget)
+			continue;
 
-    // Apply Procedural Noise (Breathing + Micro-adjustments)
-    // Using simple sin waves for breathing, Perlin-like noise for hands
-    float time = I::GlobalVars->curtime;
-    
-    // Breathing (Pitch only mostly)
-    float flBreath = std::sin(time * 2.5f) * 0.5f;
-    
-    // Micro-jitter (Hand unsteadiness)
-    float flJitterX = std::sin(time * 11.0f) * 0.2f;
-    float flJitterY = std::cos(time * 13.0f) * 0.2f;
+		Vec3 vEnemyEye = pEnemy->GetEyePosition();
+		if (SDK::VisPos(pLocal, pEnemy, vEye, vEnemyEye))
+		{
+			float flDist = vEye.DistTo(vEnemyEye);
+			if (flDist < flBestDist)
+			{
+				flBestDist = flDist;
+				pBestEnemy = pEnemy;
+			}
+		}
+	}
 
-    Vec3 vFinalAngles = state.m_vAnchor;
-    vFinalAngles.x += flBreath + flJitterX;
-    vFinalAngles.y += flJitterY;
+	for (auto pEntity : H::Entities.GetGroup(EntityEnum::BuildingEnemy))
+	{
+		auto pBuilding = pEntity->As<CBaseObject>();
+		if (!pBuilding || pBuilding->m_iHealth() <= 0 || pBuilding->IsDormant())
+			continue;
 
-    // Apply SlowAim smoothing to the final result to remove harsh ticks
-    float flSmoothFactor = std::max(1.f, (float)Vars::Misc::Movement::BotUtils::LookAtPathSpeed.Value);
-    DoSlowAim(vFinalAngles, flSmoothFactor, m_vLastAngles);
+		if (ShouldTargetBuilding(pLocal, pBuilding->entindex()) == ShouldTargetEnum::DontTarget)
+			continue;
 
-    // 4. Set Angles
-    if (bSilent) pCmd->viewangles = vFinalAngles;
-    else I::EngineClient->SetViewAngles(vFinalAngles);
-    
-    m_vLastAngles = vFinalAngles;
+		Vec3 vBuildingCenter = pBuilding->GetCenter();
+		if (SDK::VisPos(pLocal, pBuilding, vEye, vBuildingCenter))
+		{
+			float flDist = vEye.DistTo(vBuildingCenter);
+			if (flDist < flBestDist)
+			{
+				flBestDist = flDist;
+				pBestEnemy = pBuilding;
+			}
+		}
+	}
+
+	if (pBestEnemy)
+	{
+		if (pBestEnemy->IsPlayer())
+		{
+			vLook = pBestEnemy->As<CTFPlayer>()->GetEyePosition();
+			// look slightly below head (chest/neck)
+			vLook.z -= 10.f;
+		}
+		else
+		{
+			vLook = pBestEnemy->GetCenter();
+		}
+
+		iLastTarget = pBestEnemy->entindex();
+		flLastSeen = I::GlobalVars->curtime;
+		vLastPos = vLook;
+		bEnemyLock = true;
+	}
+	else if ((I::GlobalVars->curtime - flLastSeen) < 1.5f && !vLastPos.IsZero())
+	{
+		// look at last known position for a bit
+		vLook = vLastPos;
+		bEnemyLock = true;
+	}
+	else
+	{
+		// 2. movement direction
+		// look ahead based on velocity
+		const Vec3 vVelocity = pLocal->m_vecVelocity();
+		const float flSpeed = vVelocity.Length2D();
+		if (flSpeed > 25.f)
+		{
+			Vec3 vForward = vVelocity;
+			vForward.Normalize();
+			vLook = vEye + (vForward * 500.f);
+		}
+		else if (vLook.IsZero())
+		{
+			Vec3 vForward;
+			Math::AngleVectors(I::EngineClient->GetViewAngles(), &vForward, nullptr, nullptr);
+			vLook = vEye + vForward * 64.f;
+		}
+	}
+
+	Vec3 vFocus;
+	if (bEnemyLock)
+	{
+		// If looking at an enemy/spot, look directly there
+		vFocus = vLook;
+	}
+	else
+	{
+		// If pathing, use"terrain" following logic
+		const float flHeightDelta = std::clamp(vLook.z - vEye.z, -72.f, 96.f);
+		const float flPitchFactor = flHeightDelta >= 0.f ? 0.55f : 0.22f;
+		vFocus = { vLook.x, vLook.y, vEye.z + flHeightDelta * flPitchFactor + 6.f };
+	}
+
+	Vec3 vDesired = Math::CalcAngle(vEye, vFocus);
+	Math::ClampAngles(vDesired);
+
+	auto& tState = m_tLLAP;
+	const float flTargetDelta = tState.m_vLastTarget.IsZero() ? FLT_MAX : tState.m_vLastTarget.DistToSqr(vFocus);
+	if (!tState.m_bInitialized || !std::isfinite(flTargetDelta) || flTargetDelta > 4096.f)
+	{
+		tState.m_bInitialized = true;
+		tState.m_vAnchor = vDesired;
+		tState.m_vOffset = {};
+		tState.m_vOffsetGoal = {};
+		tState.m_vLastTarget = vFocus;
+		tState.m_vGlanceCurrent = {};
+		tState.m_vGlanceGoal = {};
+		tState.m_flNextOffset = SDK::RandomFloat(0.6f, 1.8f);
+		tState.m_flPhase = SDK::RandomFloat(0.f, 6.2831853f);
+		tState.m_flNextGlance = SDK::RandomFloat(1.4f, 3.0f);
+		tState.m_flGlanceDuration = SDK::RandomFloat(0.3f, 0.55f);
+		tState.m_bGlancing = false;
+		tState.m_tOffsetTimer.Update();
+		tState.m_tGlanceTimer.Update();
+		tState.m_tGlanceCooldown.Update();
+	}
+	else
+		tState.m_vLastTarget = vFocus;
+
+	float flAnchorDelta = Math::CalcFov(tState.m_vAnchor, vDesired);
+	if (!std::isfinite(flAnchorDelta) || flAnchorDelta > 120.f)
+		tState.m_vAnchor = vDesired;
+	else
+	{
+		float flAnchorBlend = std::clamp(flAnchorDelta / 90.f, 0.05f, 0.3f);
+		tState.m_vAnchor = tState.m_vAnchor.LerpAngle(vDesired, flAnchorBlend);
+	}
+
+	const float flVelocity2D = pLocal->m_vecVelocity().Length2D();
+	if (tState.m_tOffsetTimer.Run(tState.m_flNextOffset))
+	{
+		float flYawScale = std::clamp(flVelocity2D / 220.f, 0.3f, 0.95f);
+		float flPitchScale = std::clamp(flVelocity2D / 320.f, 0.18f, 0.75f);
+		tState.m_vOffsetGoal.y = SDK::RandomFloat(-28.f, 28.f) * flYawScale;
+		tState.m_vOffsetGoal.x = SDK::RandomFloat(-3.f, 4.f) * flPitchScale;
+		tState.m_flNextOffset = SDK::RandomFloat(0.65f, 1.95f);
+	}
+
+	tState.m_vOffset = tState.m_vOffset.LerpAngle(tState.m_vOffsetGoal, 0.1f);
+	if (tState.m_bGlancing)
+	{
+		if (tState.m_tGlanceTimer.Run(tState.m_flGlanceDuration))
+		{
+			tState.m_bGlancing = false;
+			tState.m_vGlanceGoal = {};
+			tState.m_flNextGlance = SDK::RandomFloat(1.6f, 3.4f);
+			tState.m_tGlanceCooldown.Update();
+		}
+	}
+	else if (tState.m_tGlanceCooldown.Run(tState.m_flNextGlance))
+	{
+		tState.m_bGlancing = true;
+		tState.m_flGlanceDuration = SDK::RandomFloat(0.28f, 0.52f);
+		float flYawGlance = SDK::RandomFloat(16.f, 38.f) * (SDK::RandomInt(0, 1) == 0 ? -1.f : 1.f);
+		tState.m_vGlanceGoal = { SDK::RandomFloat(-3.5f, 4.5f), flYawGlance, 0.f };
+		tState.m_tGlanceTimer.Update();
+	}
+
+	tState.m_vGlanceCurrent = tState.m_vGlanceCurrent.LerpAngle(tState.m_vGlanceGoal, tState.m_bGlancing ? 0.2f : 0.12f);
+
+	float flPhaseSpeed = std::clamp(flVelocity2D / 240.f, 0.25f, 1.0f);
+	tState.m_flPhase += I::GlobalVars->interval_per_tick * (0.9f + flPhaseSpeed);
+	if (tState.m_flPhase > 8192.f)
+		tState.m_flPhase = std::fmod(tState.m_flPhase, 8192.f);
+
+	float flMicroScale = std::clamp(flVelocity2D / 320.f, 0.12f, 0.4f);
+	Vec3 vMicro = {
+		std::sin(tState.m_flPhase * 0.92f) * 0.6f * flMicroScale,
+		std::sin(tState.m_flPhase * 0.55f + 1.4f) * 0.8f * flMicroScale,
+		0.f
+	};
+
+	Vec3 vGoal = tState.m_vAnchor + tState.m_vOffset + tState.m_vGlanceCurrent + vMicro;
+	Math::ClampAngles(vGoal);
+	vGoal.x = std::clamp(vGoal.x, -8.f, 22.f);
+
+	float flSpeedVal = std::max(1.f, static_cast<float>(Vars::Misc::Movement::BotUtils::LookAtPathSpeed.Value));
+	Vec3 vWish = vGoal;
+	DoSlowAim(vWish, flSpeedVal, m_vLastAngles);
+
+	if (Vars::Misc::Movement::BotUtils::LookAtPathDebug.Value)
+	{
+		G::LineStorage.emplace_back(std::pair<Vec3, Vec3>(vLook - Vec3(10, 0, 0), vLook + Vec3(10, 0, 0)), I::GlobalVars->curtime + 0.1f, Color_t{ 255, 0, 0, 255 }, false);
+		G::LineStorage.emplace_back(std::pair<Vec3, Vec3>(vLook - Vec3(0, 10, 0), vLook + Vec3(0, 10, 0)), I::GlobalVars->curtime + 0.1f, Color_t{ 0, 255, 0, 255 }, false);
+		G::LineStorage.emplace_back(std::pair<Vec3, Vec3>(vLook - Vec3(0, 0, 10), vLook + Vec3(0, 0, 10)), I::GlobalVars->curtime + 0.1f, Color_t{ 0, 0, 255, 255 }, false);
+	}
+
+	if (bSilent)
+		pCmd->viewangles = vWish;
+	else
+		I::EngineClient->SetViewAngles(vWish);
+
+	m_vLastAngles = vWish;
 }
 
+void CBotUtils::InvalidateLLAP()
+{
+	m_tLLAP = {};
+}
 
-// 
-// This function predicts where an enemy will be and checks visibility
 void CBotUtils::AutoScope(CTFPlayer* pLocal, CTFWeaponBase* pWeapon, CUserCmd* pCmd)
 {
-    // Feature gate
-    if (!Vars::Misc::Movement::BotUtils::AutoScope.Value) { m_mAutoScopeCache.clear(); return; }
-    
-    bool bIsSniperRifle = pWeapon->GetWeaponID() == TF_WEAPON_SNIPERRIFLE || pWeapon->GetWeaponID() == TF_WEAPON_SNIPERRIFLE_DECAP || pWeapon->GetWeaponID() == TF_WEAPON_SNIPERRIFLE_CLASSIC;
-    if (!bIsSniperRifle) return;
+	static bool bKeep = false;
+	static bool bShouldClearCache = false;
+	static Timer tScopeTimer{};
+	bool bIsClassic = pWeapon->GetWeaponID() == TF_WEAPON_SNIPERRIFLE_CLASSIC;
+	if (!Vars::Misc::Movement::BotUtils::AutoScope.Value || pWeapon->GetWeaponID() != TF_WEAPON_SNIPERRIFLE && !bIsClassic && pWeapon->GetWeaponID() != TF_WEAPON_SNIPERRIFLE_DECAP)
+	{
+		bKeep = false;
+		m_mAutoScopeCache.clear();
+		return;
+	}
 
-    // Clean cache periodically
-    static int iTickCount = 0;
-    if (iTickCount++ > 66) { m_mAutoScopeCache.clear(); iTickCount = 0; }
+	if (!Vars::Misc::Movement::BotUtils::AutoScopeUseCachedResults.Value)
+		bShouldClearCache = true;
 
-    Vector vLocalEye = pLocal->GetEyePosition();
-    bool bSimplePred = Vars::Misc::Movement::BotUtils::AutoScope.Value == Vars::Misc::Movement::BotUtils::AutoScopeEnum::Simple;
+	if (bShouldClearCache)
+	{
+		m_mAutoScopeCache.clear();
+		bShouldClearCache = false;
+	}
+	else if (m_mAutoScopeCache.size())
+		bShouldClearCache = true;
 
-    // Helper: Perform the trace
-    auto IsVisible = [&](const Vector& vTarget, int iEntIndex) -> bool {
-        // Check cache first
-        if (Vars::Misc::Movement::BotUtils::AutoScopeUseCachedResults.Value && m_mAutoScopeCache.contains(iEntIndex))
-            return m_mAutoScopeCache[iEntIndex];
+	if (bIsClassic)
+	{
+		if (bKeep)
+		{
+			if (!(pCmd->buttons & IN_ATTACK))
+				pCmd->buttons |= IN_ATTACK;
+			if (tScopeTimer.Check(Vars::Misc::Movement::BotUtils::AutoScopeCancelTime.Value)) // cancel classic charge
+				pCmd->buttons |= IN_JUMP;
+		}
+		if (!pLocal->OnSolid() && !(pCmd->buttons & IN_ATTACK))
+			bKeep = false;
+	}
+	else
+	{
+		if (bKeep)
+		{
+			if (pLocal->InCond(TF_COND_ZOOMED))
+			{
+				if (tScopeTimer.Check(Vars::Misc::Movement::BotUtils::AutoScopeCancelTime.Value))
+				{
+					bKeep = false;
+					pCmd->buttons |= IN_ATTACK2;
+					return;
+				}
+			}
+		}
+	}
 
-        CGameTrace trace;
-        CTraceFilterWorldAndPropsOnly filter; // Optimization: Don't trace against other players, just world
-        SDK::Trace(vLocalEye, vTarget, MASK_SHOT | CONTENTS_GRATE, &filter, &trace);
-        
-        bool visible = (trace.fraction > 0.99f || trace.m_pEnt == I::ClientEntityList->GetClientEntity(iEntIndex));
-        m_mAutoScopeCache[iEntIndex] = visible;
-        return visible;
-    };
+	CNavArea* pCurrentDestinationArea = nullptr;
+	auto pCrumbs = F::NavEngine.GetCrumbs();
+	if (pCrumbs->size() > 4)
+		pCurrentDestinationArea = pCrumbs->at(4).m_pNavArea;
 
-    // Iterate sorted enemies (closest first)
-    for (const auto& enemy : m_vCloseEnemies)
-    {
-        if (!enemy.m_pPlayer) continue;
-        if (enemy.m_flDist > 3000.f) continue; // Don't try to scope across the map unnecessarily
+	auto vLocalOrigin = pLocal->GetAbsOrigin();
+	auto pLocalNav = pCurrentDestinationArea ? pCurrentDestinationArea : F::NavEngine.FindClosestNavArea(vLocalOrigin);
+	if (!pLocalNav)
+		return;
 
-        Vector vEnemyPos = enemy.m_pPlayer->GetAbsOrigin();
-        Vector vPredictedPos = vEnemyPos;
+	Vector vFrom = pLocalNav->m_vCenter;
+	vFrom.z += PLAYER_JUMP_HEIGHT;
 
-        // Prediction Logic
-        if (bSimplePred) {
-            vPredictedPos += enemy.m_pPlayer->m_vecVelocity() * 0.2f; // Simple linear extrapolation (200ms)
-        } else {
-            // Full MoveSim (Expensive, use sparingly)
-            MoveStorage storage;
-            if (F::MoveSim.Initialize(enemy.m_pPlayer, storage, false)) {
-                F::MoveSim.RunTick(storage); // Run 1 tick? Or more? 
-                // Running too many ticks is heavy. Usually ~10 ticks (150ms) is enough for reaction time
-                for(int i=0; i<10; i++) F::MoveSim.RunTick(storage);
-                vPredictedPos = storage.m_vPredictedOrigin;
-                F::MoveSim.Restore(storage);
-            }
-        }
+	std::vector<std::pair<CBaseEntity*, float>> vEnemiesSorted;
+	for (auto pEnemy : H::Entities.GetGroup(EntityEnum::PlayerEnemy))
+	{
+		if (pEnemy->IsDormant())
+			continue;
 
-        // Check Head Height (roughly 75 units up)
-        vPredictedPos.z += 70.0f; 
+		if (!ShouldTarget(pLocal, pWeapon, pEnemy->entindex()))
+			continue;
 
-        if (IsVisible(vPredictedPos, enemy.m_iEntIndex))
-        {
-            // Scope in!
-            if (!pLocal->InCond(TF_COND_ZOOMED))
-                pCmd->buttons |= IN_ATTACK2;
-            
-            // Wait logic can be added here (wait for full charge etc.)
-            return; // Found a target, stop processing
-        }
-    }
+		vEnemiesSorted.emplace_back(pEnemy, pEnemy->GetAbsOrigin().DistToSqr(vLocalOrigin));
+	}
+
+	for (auto pEnemyBuilding : H::Entities.GetGroup(EntityEnum::BuildingEnemy))
+	{
+		if (pEnemyBuilding->IsDormant())
+			continue;
+
+		if (!ShouldTargetBuilding(pLocal, pEnemyBuilding->entindex()))
+			continue;
+
+		vEnemiesSorted.emplace_back(pEnemyBuilding, pEnemyBuilding->GetAbsOrigin().DistToSqr(vLocalOrigin));
+	}
+
+	if (vEnemiesSorted.empty())
+		return;
+
+	std::sort(vEnemiesSorted.begin(), vEnemiesSorted.end(), [&](std::pair<CBaseEntity*, float> a, std::pair<CBaseEntity*, float> b) -> bool { return a.second < b.second; });
+
+	auto CheckVisibility = [&](const Vec3& vTo, int iEntIndex) -> bool
+		{
+			CGameTrace trace = {};
+			CTraceFilterWorldAndPropsOnly filter = {};
+
+			// Trace from local pos first
+			SDK::Trace(Vector(vLocalOrigin.x, vLocalOrigin.y, vLocalOrigin.z + PLAYER_JUMP_HEIGHT), vTo, MASK_SHOT | CONTENTS_GRATE, &filter, &trace);
+			bool bHit = trace.fraction == 1.0f;
+			if (!bHit)
+			{
+				// Try to trace from our destination pos
+				SDK::Trace(vFrom, vTo, MASK_SHOT | CONTENTS_GRATE, &filter, &trace);
+				bHit = trace.fraction == 1.0f;
+			}
+
+			if (iEntIndex != -1)
+				m_mAutoScopeCache[iEntIndex] = bHit;
+
+			if (bHit)
+			{
+				if (bIsClassic)
+					pCmd->buttons |= IN_ATTACK;
+				else if (!pLocal->InCond(TF_COND_ZOOMED) && !(pCmd->buttons & IN_ATTACK2))
+					pCmd->buttons |= IN_ATTACK2;
+
+				tScopeTimer.Update();
+				return bKeep = true;
+			}
+			return false;
+		};
+
+	bool bSimple = Vars::Misc::Movement::BotUtils::AutoScope.Value == Vars::Misc::Movement::BotUtils::AutoScopeEnum::Simple;
+
+	int iMaxTicks = TIME_TO_TICKS(0.5f);
+	MoveStorage tStorage;
+	for (auto [pEnemy, _] : vEnemiesSorted)
+	{
+		int iEntIndex = Vars::Misc::Movement::BotUtils::AutoScopeUseCachedResults.Value ? pEnemy->entindex() : -1;
+		if (m_mAutoScopeCache.contains(iEntIndex))
+		{
+			if (m_mAutoScopeCache[iEntIndex])
+			{
+				if (bIsClassic)
+					pCmd->buttons |= IN_ATTACK;
+				else if (!pLocal->InCond(TF_COND_ZOOMED) && !(pCmd->buttons & IN_ATTACK2))
+					pCmd->buttons |= IN_ATTACK2;
+
+				tScopeTimer.Update();
+				bKeep = true;
+				break;
+			}
+			continue;
+		}
+
+		Vector vNonPredictedPos = pEnemy->GetAbsOrigin();
+		vNonPredictedPos.z += PLAYER_JUMP_HEIGHT;
+		if (CheckVisibility(vNonPredictedPos, iEntIndex))
+			return;
+
+		if (!bSimple)
+		{
+			F::MoveSim.Initialize(pEnemy, tStorage, false);
+			if (tStorage.m_bFailed)
+			{
+				F::MoveSim.Restore(tStorage);
+				continue;
+			}
+
+			for (int i = 0; i < iMaxTicks; i++)
+				F::MoveSim.RunTick(tStorage);
+		}
+
+		bool bResult = false;
+		Vector vPredictedPos = bSimple ? pEnemy->GetAbsOrigin() + pEnemy->GetAbsVelocity() * TICKS_TO_TIME(iMaxTicks) : tStorage.m_vPredictedOrigin;
+
+		auto pTargetNav = F::NavEngine.FindClosestNavArea(vPredictedPos, false);
+		if (pTargetNav)
+		{
+			Vector vTo = pTargetNav->m_vCenter;
+
+			// If player is in the air dont try to vischeck nav areas below him, check the predicted position instead
+			if (!pEnemy->As<CBasePlayer>()->OnSolid() && vTo.DistToSqr(vPredictedPos) >= pow(400.f, 2))
+				vTo = vPredictedPos;
+
+			vTo.z += PLAYER_JUMP_HEIGHT;
+			bResult = CheckVisibility(vTo, iEntIndex);
+		}
+		if (!bSimple)
+			F::MoveSim.Restore(tStorage);
+
+		if (bResult)
+			break;
+	}
 }
 
 void CBotUtils::Run(CTFPlayer* pLocal, CTFWeaponBase* pWeapon, CUserCmd* pCmd)
 {
-    // Master Switch
-    if ((!Vars::Misc::Movement::NavBot::Enabled.Value && 
-        !(Vars::Misc::Movement::FollowBot::Enabled.Value && Vars::Misc::Movement::FollowBot::Targets.Value)) ||
-        !pLocal->IsAlive() || !pWeapon)
-    {
-        Reset();
-        return;
-    }
+	if ((!Vars::Misc::Movement::NavBot::Enabled.Value && !(Vars::Misc::Movement::FollowBot::Enabled.Value && Vars::Misc::Movement::FollowBot::Targets.Value)) ||
+		!pLocal->IsAlive() || !pWeapon)
+	{
+		Reset();
+		return;
+	}
 
-    // 1. Update World State (Enemies)
-    // We update this every tick, but inside it uses lightweight distance checks
-    m_tClosestEnemy = UpdateCloseEnemies(pLocal, pWeapon);
-    
-    // 2. Weapon Slot Logic
-    // Run this less frequently to prevent "jittery" weapon switching? 
-    // Currently runs every tick, which is fine if logic is stable.
-    m_iCurrentSlot = pWeapon->GetSlot();
-    UpdateBestSlot(pLocal);
+	m_tClosestEnemy = UpdateCloseEnemies(pLocal, pWeapon);
+	m_iCurrentSlot = pWeapon->GetSlot();
+	UpdateBestSlot(pLocal);
 
-    // 3. Auto Scope
-    AutoScope(pLocal, pWeapon, pCmd);
+	if (!F::NavEngine.IsNavMeshLoaded() || (pCmd->buttons & (IN_FORWARD | IN_BACK | IN_MOVERIGHT | IN_MOVELEFT) && !F::Misc.m_bAntiAFK))
+	{
+		m_mAutoScopeCache.clear();
+		return;
+	}
 
-    // 4. Minigun Auto-Rev
-    if (pWeapon->GetWeaponID() == TF_WEAPON_MINIGUN)
-    {
-        bool bShouldRev = false;
-        if (m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_flDist < 900.f) {
-             // Only rev if we have line of sight?
-             if (SDK::VisPos(pLocal, m_tClosestEnemy.m_pPlayer, pLocal->GetEyePosition(), m_tClosestEnemy.m_pPlayer->GetEyePosition()))
-                 bShouldRev = true;
-        }
+	AutoScope(pLocal, pWeapon, pCmd);
 
-        if (bShouldRev && pWeapon->HasAmmo())
-            pCmd->buttons |= IN_ATTACK2;
-    }
+	// Spin up the minigun if there are enemies nearby or if we had an active aimbot target 
+	if (pWeapon->GetWeaponID() == TF_WEAPON_MINIGUN)
+	{
+		static Timer tSpinupTimer{};
+		if (m_tClosestEnemy.m_pPlayer && m_tClosestEnemy.m_pPlayer->IsAlive() && !m_tClosestEnemy.m_pPlayer->IsInvulnerable() && pWeapon->HasAmmo())
+		{
+			if (G::AimTarget.m_iEntIndex && G::AimTarget.m_iDuration || m_tClosestEnemy.m_flDist <= 800.f)
+				tSpinupTimer.Update();
+			if (!tSpinupTimer.Check(3.f)) // 3 seconds until unrev
+				pCmd->buttons |= IN_ATTACK2;
+		}
+	}
 }
 
 void CBotUtils::Reset()
 {
-    m_mAutoScopeCache.clear();
-    m_vCloseEnemies.clear();
-    m_tClosestEnemy = {};
-    m_iBestSlot = -1;
-    m_iCurrentSlot = -1;
-    InvalidateLLAP();
+	m_mAutoScopeCache.clear();
+	m_vCloseEnemies.clear();
+	m_tClosestEnemy = {};
+	m_iBestSlot = -1;
+	m_iCurrentSlot = -1;
+	InvalidateLLAP();
 }
