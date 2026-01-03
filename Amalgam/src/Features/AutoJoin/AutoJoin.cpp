@@ -1,9 +1,10 @@
 #include "AutoJoin.h"
-#include <format>
+#include <cstdio> // Required for snprintf
+#include <string>
 
 void CAutoJoin::Run(CTFPlayer* pLocal)
 {
-    // 1. Safety Checks
+    // 1. Basic Safety Checks
     if (!pLocal || !I::EngineClient->IsInGame() || !I::EngineClient->IsConnected())
         return;
 
@@ -15,46 +16,54 @@ void CAutoJoin::Run(CTFPlayer* pLocal)
 
     if (Vars::Misc::Automation::RandomClass.Value)
     {
+        // If random class is enabled, pick a new one periodically
         if (!iRandomClass || tRandomTimer.Run(Vars::Misc::Automation::RandomClassInterval.Value * 60.f))
         {
             int iExclude = Vars::Misc::Automation::RandomClassExclude.Value;
-            do { iRandomClass = SDK::RandomInt(1, 9); }
+            
+            // Simple retry loop to find a class not in the exclude list
+            do { iRandomClass = SDK::RandomInt(1, 9); } 
             while (iExclude & (1 << (iRandomClass - 1)));
         }
         iDesiredClass = iRandomClass;
     }
     else
     {
-        iRandomClass = 0;
+        // Reset random class tracker if random is disabled
+        iRandomClass = 0; 
     }
 
-    // 3. Get Current State
-    // Note: Adjust property names (m_iTeamNum, m_iClass) if your SDK uses specific getters like GetTeamNum()
-    int iCurrentTeam = pLocal->m_iTeamNum(); 
-    int iCurrentClass = pLocal->m_iClass();
+    // 3. Check if we actually need to do anything
+    // FIX: Removed parentheses. m_iTeamNum and m_iClass are NetVars (integers), not functions.
+    int iCurrentTeam = pLocal->m_iTeamNum; 
+    int iCurrentClass = pLocal->m_iClass;
 
-    bool bValidTeam = (iCurrentTeam == 2 || iCurrentTeam == 3); // TF_TEAM_RED, TF_TEAM_BLU
+    bool bValidTeam = (iCurrentTeam == 2 || iCurrentTeam == 3); // 2 = Red, 3 = Blu
     bool bValidClass = (iDesiredClass > 0 && iDesiredClass < 10);
 
-    // 4. Execution
-    // Using a static timer to avoid spamming the console every single frame
+    // 4. Execute Logic
+    // We use a static timer to prevent spamming the console every single frame
     static Timer tJoinTimer{};
     
     if (tJoinTimer.Run(0.5f))
     {
-        // If we are not on a valid team (Unassigned or Spec), join a team immediately.
-        // 'autoteam' bypasses the VGUI menu, fixing custom HUD issues.
         if (!bValidTeam)
         {
+            // We are not on a valid team (Unassigned or Spectator).
+            // Use 'autoteam' command directly. This bypasses the VGUI menu (fixes custom HUD issues).
             I::EngineClient->ClientCmd_Unrestricted("autoteam");
         }
-        // If we are on a team, but not the class we want, switch class.
         else if (bValidClass && iCurrentClass != iDesiredClass)
         {
-            // Access the static constexpr array defined in the header
+            // We are on a team, but not the desired class.
+            // Get the class string (Scout, Soldier, etc.) from the header array
             const char* szClassCmd = m_aClassNames[iDesiredClass - 1];
             
-            I::EngineClient->ClientCmd_Unrestricted(std::format("joinclass {}", szClassCmd).c_str());
+            // FIX: Used snprintf instead of std::format to prevent MSBuild linker errors.
+            char szCommand[64];
+            snprintf(szCommand, sizeof(szCommand), "joinclass %s", szClassCmd);
+            
+            I::EngineClient->ClientCmd_Unrestricted(szCommand);
         }
     }
 }
