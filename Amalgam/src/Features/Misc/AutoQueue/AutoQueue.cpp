@@ -5,8 +5,11 @@
 #ifdef TEXTMODE
 #include "../NamedPipe/NamedPipe.h"
 #endif
+
 #include <algorithm>
 #include <fstream>
+#include <cstdio>   // Required for snprintf
+#include <cstring>  // Required for strncpy_s
 
 void CAutoQueue::Run()
 {
@@ -47,7 +50,6 @@ void CAutoQueue::Run()
     // 2. MapBar Boost (Abandon bad maps immediately)
     if (Vars::Misc::Queueing::MapBarBoost.Value && bIsLoading && I::TFGCClientSystem)
     {
-        // Only abandon if we actually were in a match previously to avoid abandoning menu interactions
         static bool bWasFullyInGame = false;
         if (bWasFullyInGame)
         {
@@ -103,7 +105,12 @@ void CAutoQueue::Run()
                     if (I::TFGCClientSystem)
                     {
                         const size_t uDuplicateCount = tResult.m_uSkippedSessionDuplicate + tResult.m_uSkippedFileDuplicate;
-                        SDK::Output("AutoQueue", std::format("Auto dump complete: {} new profiles. Abandoning.", tResult.m_uAppendedCount).c_str(), { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                        
+                        // Use snprintf instead of std::format
+                        char szMsg[256];
+                        snprintf(szMsg, sizeof(szMsg), "Auto dump complete: %zu new profiles. Abandoning.", tResult.m_uAppendedCount);
+                        SDK::Output("AutoQueue", szMsg, { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                        
                         I::TFGCClientSystem->AbandonCurrentMatch();
                         flLastAbandonTime = flCurrentTime;
                         bQueuedCasual = false;
@@ -231,7 +238,10 @@ void CAutoQueue::Run()
                 {
                     I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_Casual_Default);
                     bQueuedCasual = true;
-                    SDK::Output("AutoQueue", std::format("RQif: Double queueing (Players: {}).", nPlayerCount).c_str(), { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                    
+                    char szMsg[128];
+                    snprintf(szMsg, sizeof(szMsg), "RQif: Double queueing (Players: %d).", nPlayerCount);
+                    SDK::Output("AutoQueue", szMsg, { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
                 }
             }
             else
@@ -242,7 +252,10 @@ void CAutoQueue::Run()
                     if (I::TFGCClientSystem) I::TFGCClientSystem->AbandonCurrentMatch();
                     flLastAbandonTime = flCurrentTime;
                     bQueuedCasual = false; // We will queue once disconnected
-                    SDK::Output("AutoQueue", std::format("RQif: Abandoning (Players: {}).", nPlayerCount).c_str(), { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                    
+                    char szMsg[128];
+                    snprintf(szMsg, sizeof(szMsg), "RQif: Abandoning (Players: %d).", nPlayerCount);
+                    SDK::Output("AutoQueue", szMsg, { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
                 }
             }
         }
@@ -348,7 +361,7 @@ void CAutoQueue::SearchCommunityServers()
 
     std::vector<MatchMakingKeyValuePair_t> vFilters;
     
-    // Helper lambda to add filters
+    // Helper lambda to add filters using MSVC safe string copy
     auto addFilter = [&vFilters](const char* key, const char* val) {
         MatchMakingKeyValuePair_t filter;
         strncpy_s(filter.m_szKey, key, sizeof(filter.m_szKey));
@@ -395,7 +408,10 @@ void CAutoQueue::ConnectToServer(const gameserveritem_t* pServer)
     if (sServerAddress == m_sCurrentServerIP && (I::EngineClient->Time() - m_flServerJoinTime) < 60.0f)
         return;
 
-    SDK::Output("AutoQueue", std::format("Connecting to: {} [{}]", pServer->GetName(), sServerAddress).c_str(), { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    // Use snprintf for output
+    char szMsg[256];
+    snprintf(szMsg, sizeof(szMsg), "Connecting to: %s [%s]", pServer->GetName(), sServerAddress.c_str());
+    SDK::Output("AutoQueue", szMsg, { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
 
     std::string sConnectCmd = "connect " + sServerAddress;
     I::EngineClient->ClientCmd_Unrestricted(sConnectCmd.c_str());
@@ -424,14 +440,9 @@ bool CAutoQueue::IsServerValid(const gameserveritem_t* pServer)
     if (Vars::Misc::Queueing::RequireNavmesh.Value && !HasNavmeshForMap(pServer->m_szMap))
         return false;
 
-    // IMPORTANT FIX: "PreferSteamNick" should NOT be a hard validator.
-    // If no named servers are found, we should still join normal servers.
-    // Moved this check to RefreshComplete for sorting priority only.
-
     if (Vars::Misc::Queueing::OnlySteamNetworkingIPs.Value)
     {
         std::string sServerIP = pServer->m_NetAdr.GetConnectionAddressString();
-        
         if (sServerIP.rfind("169.254", 0) != 0) return false; 
     }
 
@@ -462,7 +473,7 @@ bool CAutoQueue::HasNavmeshForMap(const std::string& sMapName)
 
 bool CAutoQueue::IsServerNameMatch(const std::string& sServerName)
 {
-    // Check for "'s Server" pattern (e.g., "SteamUser's Server")
+    // Check for "'s Server" pattern
     size_t sServerPos = sServerName.rfind("'s Server");
     if (sServerPos == std::string::npos) return false;
     
@@ -526,7 +537,11 @@ void CAutoQueue::RefreshComplete(HServerListRequest hRequest, EMatchMakingServer
     if (hRequest != m_hServerListRequest) return;
 
     m_bSearchingServers = false;
-    SDK::Output("AutoQueue", std::format("Found {} valid servers.", m_vCommunityServers.size()).c_str(), { 100, 255, 100 }, OUTPUT_CONSOLE);
+    
+    // Use snprintf for output
+    char szMsg[128];
+    snprintf(szMsg, sizeof(szMsg), "Found %zu valid servers.", m_vCommunityServers.size());
+    SDK::Output("AutoQueue", szMsg, { 100, 255, 100 }, OUTPUT_CONSOLE);
 
     if (!m_vCommunityServers.empty())
     {
