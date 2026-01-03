@@ -31,8 +31,3 @@
   
   Read about the original Amalgam documentation and features [here](https://github.com/rei-2/Amalgam/wiki). Note: This is **schmidorga-coder's fork** with additional features and changes over the original rei-2 version. 
 </div>
-
-  - Auto accept item drops now removes the notification from ui aswell
-  - Changed loading process allowing for early injection (e.g. Xenos manual launch)
-  - Added signature generator for crash log call trace
-  - Fixed menu tooltips not accounting for newlines (also fixed on the official repo since [this commit](https://github.com/rei-2/Amalgam/commit/68c1d0530f37554cdd84dbefb6eb475f13b45b07))
