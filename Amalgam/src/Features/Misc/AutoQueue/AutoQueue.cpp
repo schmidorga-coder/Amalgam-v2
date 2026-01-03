@@ -5,533 +5,551 @@
 #ifdef TEXTMODE
 #include "../NamedPipe/NamedPipe.h"
 #endif
+#include <algorithm>
+#include <fstream>
 
 void CAutoQueue::Run()
 {
-	static float flLastQueueTime = 0.0f;
-	static bool bQueuedOnce = false;
-	static bool bWasInGame = false;
-	static bool bWasDisconnected = false;
-	static bool bQueuedFromRQif = false;
+    // Timers and State
+    static float flLastQueueTime = 0.0f;
+    static float flLastAbandonTime = 0.0f;
+    static float flLastMannUpQueueTime = 0.0f;
+    
+    static bool bQueuedCasual = false;
+    static bool bQueuedMannUp = false;
 
-	const bool bInGameNow = I::EngineClient->IsInGame();
-	const bool bIsLoadingMapNow = I::EngineClient->IsDrawingLoadingImage();
-	const char* pszLevelName = I::EngineClient->GetLevelName();
-	const std::string sLevelName = pszLevelName ? pszLevelName : "";
+    // Engine State
+    const bool bInGame = I::EngineClient->IsInGame();
+    const bool bIsLoading = I::EngineClient->IsDrawingLoadingImage();
+    const bool bIsConnected = I::EngineClient->IsConnected();
+    const bool bHasNetChannel = I::ClientState && I::ClientState->m_NetChannel;
+    
+    const char* pszLevelName = I::EngineClient->GetLevelName();
+    const std::string sLevelName = pszLevelName ? pszLevelName : "";
+    const float flCurrentTime = I::EngineClient->Time();
 
-	if (Vars::Misc::Queueing::MapBarBoost.Value && bIsLoadingMapNow)
-	{
-		if (I::TFGCClientSystem)
-			I::TFGCClientSystem->AbandonCurrentMatch();
-		return;
-	}
+    // 1. Map Change Handling
+    if (sLevelName != m_sLastLevelName)
+    {
+        m_sLastLevelName = sLevelName;
+        m_bNavmeshAbandonTriggered = false;
+        m_bAutoDumpedThisMatch = false;
+        m_flAutoDumpStartTime = 0.0f;
+        
+        // Reset queue states on map load to be safe
+        if (bIsLoading && !sLevelName.empty()) 
+        {
+            bQueuedCasual = false;
+            bQueuedMannUp = false;
+        }
+    }
 
-	if (sLevelName != m_sLastLevelName)
-	{
-		m_sLastLevelName = sLevelName;
-		m_bNavmeshAbandonTriggered = false;
-		m_bAutoDumpedThisMatch = false;
-		m_flAutoDumpStartTime = 0.0f;
-	}
+    // 2. MapBar Boost (Abandon bad maps immediately)
+    if (Vars::Misc::Queueing::MapBarBoost.Value && bIsLoading && I::TFGCClientSystem)
+    {
+        // Only abandon if we actually were in a match previously to avoid abandoning menu interactions
+        static bool bWasFullyInGame = false;
+        if (bWasFullyInGame)
+        {
+            I::TFGCClientSystem->AbandonCurrentMatch();
+            flLastAbandonTime = flCurrentTime;
+            SDK::Output("AutoQueue", "MapBar Boost: Abandoning match due to level change.", { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+        }
+        
+        if (bInGame && !bIsLoading) bWasFullyInGame = true;
+        else if (!bInGame) bWasFullyInGame = false;
+        
+        return;
+    }
 
-	if (!Vars::Misc::Queueing::AutoAbandonIfNoNavmesh.Value)
-		m_bNavmeshAbandonTriggered = false;
-	else if (bInGameNow && !bIsLoadingMapNow && !m_bNavmeshAbandonTriggered)
-	{
-		const bool bNavMeshUnavailable = !F::NavEngine.IsNavMeshLoaded();
-		if (bNavMeshUnavailable)
-		{
-			m_bNavmeshAbandonTriggered = true;
-			SDK::Output("AutoQueue", "No navmesh available for current map, abandoning match", { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-			I::TFGCClientSystem->AbandonCurrentMatch();
-			bWasInGame = false;
-			bWasDisconnected = true;
-			flLastQueueTime = 0.0f;
-			bQueuedFromRQif = false;
-			return;
-		}
-	}
+    // 3. Auto Abandon (No Navmesh)
+    if (Vars::Misc::Queueing::AutoAbandonIfNoNavmesh.Value && bInGame && !bIsLoading)
+    {
+        if (!m_bNavmeshAbandonTriggered && !F::NavEngine.IsNavMeshLoaded())
+        {
+            m_bNavmeshAbandonTriggered = true;
+            SDK::Output("AutoQueue", "No navmesh available, abandoning match.", { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+            if (I::TFGCClientSystem) I::TFGCClientSystem->AbandonCurrentMatch();
+            flLastAbandonTime = flCurrentTime;
+            bQueuedCasual = false; // Force requeue check
+            return;
+        }
+    }
+    else if (!Vars::Misc::Queueing::AutoAbandonIfNoNavmesh.Value)
+    {
+        m_bNavmeshAbandonTriggered = false;
+    }
 
-	if (Vars::Misc::Queueing::AutoDumpProfiles.Value && Vars::Misc::Queueing::AutoCasualQueue.Value && !Vars::Misc::Queueing::AutoCommunityQueue.Value)
-	{
-		if (bInGameNow && !bIsLoadingMapNow && !m_bAutoDumpedThisMatch)
-		{
-			const float flDelay = std::max(0, Vars::Misc::Queueing::AutoDumpDelay.Value);
-			const float flCurrentTime = I::EngineClient->Time();
-			if (m_flAutoDumpStartTime <= 0.0f)
-				m_flAutoDumpStartTime = flCurrentTime;
+    // 4. Auto Dump Profiles
+    if (Vars::Misc::Queueing::AutoDumpProfiles.Value && Vars::Misc::Queueing::AutoCasualQueue.Value && !Vars::Misc::Queueing::AutoCommunityQueue.Value)
+    {
+        if (bInGame && !bIsLoading && !m_bAutoDumpedThisMatch)
+        {
+            const float flDelay = std::max(0.0f, Vars::Misc::Queueing::AutoDumpDelay.Value);
+            if (m_flAutoDumpStartTime <= 0.0f) m_flAutoDumpStartTime = flCurrentTime;
 
-			if ((flCurrentTime - m_flAutoDumpStartTime) >= flDelay)
-			{
-				const auto tResult = F::Misc.DumpProfiles(false);
-				if (!tResult.m_bResourceAvailable || tResult.m_uCandidateCount == 0)
-					m_flAutoDumpStartTime = flCurrentTime;
-				else
-				{
-					m_bAutoDumpedThisMatch = true;
-					m_flAutoDumpStartTime = 0.0f;
+            if ((flCurrentTime - m_flAutoDumpStartTime) >= flDelay)
+            {
+                const auto tResult = F::Misc.DumpProfiles(false);
+                if (!tResult.m_bResourceAvailable || tResult.m_uCandidateCount == 0)
+                {
+                    m_flAutoDumpStartTime = flCurrentTime; // Retry later
+                }
+                else
+                {
+                    m_bAutoDumpedThisMatch = true;
+                    m_flAutoDumpStartTime = 0.0f;
 
-					if (I::TFGCClientSystem)
-					{
-						const size_t uDuplicateCount = tResult.m_uSkippedSessionDuplicate + tResult.m_uSkippedFileDuplicate;
-						SDK::Output("AutoQueue", std::format("Auto dump complete: {} new profiles, {} duplicates skipped, {} comma filtered. Avatars: {} saved, {} unavailable, {} failed. Abandoning match for requeue.",
-							tResult.m_uAppendedCount,
-							uDuplicateCount,
-							tResult.m_uSkippedComma,
-							tResult.m_uAvatarsSaved,
-							tResult.m_uAvatarMissed,
-							tResult.m_uAvatarFailed).c_str(), { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-						I::TFGCClientSystem->AbandonCurrentMatch();
-						bWasInGame = false;
-						bWasDisconnected = true;
-						flLastQueueTime = 0.0f;
-						bQueuedFromRQif = false;
-						bQueuedOnce = false;
-					}
-				}
-			}
-		}
-		else if (!bInGameNow)
-		{
-			m_bAutoDumpedThisMatch = false;
-			m_flAutoDumpStartTime = 0.0f;
-		}
-	}
-	else
-	{
-		m_flAutoDumpStartTime = 0.0f;
-		if (!bInGameNow)
-			m_bAutoDumpedThisMatch = false;
-	}
+                    if (I::TFGCClientSystem)
+                    {
+                        const size_t uDuplicateCount = tResult.m_uSkippedSessionDuplicate + tResult.m_uSkippedFileDuplicate;
+                        SDK::Output("AutoQueue", std::format("Auto dump complete: {} new profiles. Abandoning.", tResult.m_uAppendedCount).c_str(), { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                        I::TFGCClientSystem->AbandonCurrentMatch();
+                        flLastAbandonTime = flCurrentTime;
+                        bQueuedCasual = false;
+                    }
+                }
+            }
+        }
+        else if (!bInGame)
+        {
+            m_bAutoDumpedThisMatch = false;
+            m_flAutoDumpStartTime = 0.0f;
+        }
+    }
 
-	// Auto Mann Up queue
-	if (Vars::Misc::Queueing::AutoMannUpQueue.Value)
-	{
-		if (!I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_MvM_MannUp))
-		{
-			bool bInGame = I::EngineClient->IsInGame();
-			bool bIsLoadingMap = I::EngineClient->IsDrawingLoadingImage();
-			if (bIsLoadingMap && Vars::Misc::Queueing::RQLTM.Value)
-				return;
+    // Cancel queues if loading (Safety check)
+    if (bIsLoading)
+    {
+        if (bQueuedCasual && I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_Casual_Default))
+        {
+            I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_Casual_Default);
+            bQueuedCasual = false;
+            SDK::Output("AutoQueue", "Loading: Cancelled casual queue.", { 255, 255, 100 }, OUTPUT_CONSOLE);
+        }
+        if (bQueuedMannUp && I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_MvM_MannUp))
+        {
+            I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_MvM_MannUp);
+            bQueuedMannUp = false;
+        }
+        return; // Do nothing else while loading
+    }
 
-			float flCurrentTime = I::EngineClient->Time();
-			float flQueueDelay = Vars::Misc::Queueing::QueueDelay.Value == 0 ? 20.0f : Vars::Misc::Queueing::QueueDelay.Value * 60.0f;
+    // 5. Mann Up Queue
+    if (Vars::Misc::Queueing::AutoMannUpQueue.Value)
+    {
+        bool bIsQueued = I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_MvM_MannUp);
+        if (!bIsQueued && !bInGame && !bIsConnected)
+        {
+            // Calculate Delay
+            float flQueueDelay = (Vars::Misc::Queueing::QueueDelay.Value == 0) ? 20.0f : Vars::Misc::Queueing::QueueDelay.Value * 60.0f;
+            
+            // Check Timer
+            if (!bQueuedMannUp || (flCurrentTime - flLastMannUpQueueTime >= flQueueDelay))
+            {
+                if (I::TFPartyClient)
+                {
+                    I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_MvM_MannUp);
+                    flLastMannUpQueueTime = flCurrentTime;
+                    bQueuedMannUp = true;
+                    SDK::Output("AutoQueue", "Queued for Mann Up.", { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                }
+            }
+        }
+        else if (bIsQueued)
+        {
+            bQueuedMannUp = true;
+        }
+    }
+    else
+    {
+        if (bQueuedMannUp && I::TFPartyClient)
+        {
+            I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_MvM_MannUp);
+            bQueuedMannUp = false;
+        }
+    }
 
-			static float flLastQueueTimeMannUp = 0.0f;
-			static bool bQueuedOnceMannUp = false;
+    // 6. Casual Queue Logic
+    if (Vars::Misc::Queueing::AutoCasualQueue.Value)
+    {
+        bool bIsQueued = I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_Casual_Default);
+        
+        // RQif (Requeue If player count conditions met)
+        bool bRQifActive = Vars::Misc::Queueing::RQif.Value;
+        bool bRQConditionMet = false;
+        int nPlayerCount = 0;
 
-			bool bShouldQueue = !bQueuedOnceMannUp || (flCurrentTime - flLastQueueTimeMannUp >= flQueueDelay);
-			if (bShouldQueue && !bInGame && !bIsLoadingMap)
-			{
-				I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_MvM_MannUp);
-				flLastQueueTimeMannUp = flCurrentTime;
-				bQueuedOnceMannUp = true;
-			}
-		}
-	}
+        if (bInGame && bRQifActive)
+        {
+            if (auto pResource = H::Entities.GetResource())
+            {
+                for (int i = 1; i <= I::EngineClient->GetMaxClients(); i++)
+                {
+                    if (!pResource->m_bValid(i) || !pResource->m_bConnected(i) || pResource->m_iUserID(i) == -1)
+                        continue;
+                    if (pResource->IsFakePlayer(i))
+                        continue;
 
-	if (Vars::Misc::Queueing::AutoCasualQueue.Value)
-	{
-		float flCurrentTime = I::EngineClient->Time();
-		bool bInGame = I::EngineClient->IsInGame();
-		bool bIsLoadingMap = I::EngineClient->IsDrawingLoadingImage();
-		bool bIsConnected = I::EngineClient->IsConnected();
-		bool bHasNetChannel = I::ClientState && I::ClientState->m_NetChannel;
-		bool bIsQueued = I::TFPartyClient->BInQueueForMatchGroup(k_eTFMatchGroup_Casual_Default);
+                    bool bShouldCount = true;
+                    const uint32_t uFriendsID = pResource->m_iAccountID(i);
 
-		if (bIsLoadingMap && bIsQueued)
-		{
-			I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_Casual_Default);
-			SDK::Output("AutoQueue", "Loading screen active, canceling casual queue", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-			bQueuedFromRQif = false;
-			flLastQueueTime = flCurrentTime;
-			bIsQueued = false;
-		}
-
-		if (bIsLoadingMap && Vars::Misc::Queueing::RQLTM.Value)
-			return;
-
-		float flQueueDelay = Vars::Misc::Queueing::QueueDelay.Value == 0 ? 20.0f : Vars::Misc::Queueing::QueueDelay.Value * 60.0f;
-
-		int nPlayerCount = 0;
-		bool bRQConditionMet = false;
-
-		if (bInGame && Vars::Misc::Queueing::RQif.Value)
-		{
-			if (auto pResource = H::Entities.GetResource())
-			{
-				for (int i = 1; i <= I::EngineClient->GetMaxClients(); i++)
-				{
-					if (!pResource->m_bValid(i) || !pResource->m_bConnected(i) || pResource->m_iUserID(i) == -1)
-						continue;
-
-					if (pResource->IsFakePlayer(i))
-						continue;
-
-					bool bShouldCount = true;
-					const uint32_t uFriendsID = pResource->m_iAccountID(i);
-
-					if (Vars::Misc::Queueing::RQIgnoreFriends.Value)
-					{
+                    if (Vars::Misc::Queueing::RQIgnoreFriends.Value)
+                    {
 #ifdef TEXTMODE
-						if (uFriendsID && F::NamedPipe.IsLocalBot(uFriendsID))
-							bShouldCount = false;
+                        if (uFriendsID && F::NamedPipe.IsLocalBot(uFriendsID))
+                            bShouldCount = false;
 #endif
+                        if (bShouldCount && (H::Entities.IsFriend(uFriendsID) || H::Entities.InParty(uFriendsID) ||
+                            F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(FRIEND_TAG)) ||
+                            F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(FRIEND_IGNORE_TAG)) ||
+                            F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(IGNORED_TAG)) ||
+                            F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(BOT_IGNORE_TAG)) ||
+                            F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(PARTY_TAG))))
+                        {
+                            bShouldCount = false;
+                        }
+                    }
 
-						if (bShouldCount && (H::Entities.IsFriend(uFriendsID) ||
-							H::Entities.InParty(uFriendsID) ||
-							F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(FRIEND_TAG)) ||
-							F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(FRIEND_IGNORE_TAG)) ||
-							F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(IGNORED_TAG)) ||
-							F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(BOT_IGNORE_TAG)) ||
-							F::PlayerUtils.HasTag(uFriendsID, F::PlayerUtils.TagToIndex(PARTY_TAG))))
-							bShouldCount = false;
-					}
+                    if (bShouldCount) nPlayerCount++;
+                }
+            }
 
-					if (bShouldCount)
-						nPlayerCount++;
-				}
-			}
+            int nPlayersLT = Vars::Misc::Queueing::RQplt.Value;
+            int nPlayersGT = Vars::Misc::Queueing::RQpgt.Value;
+            if ((nPlayersLT > 0 && nPlayerCount < nPlayersLT) || (nPlayersGT > 0 && nPlayerCount > nPlayersGT))
+                bRQConditionMet = true;
+        }
 
-			int nPlayersLT = Vars::Misc::Queueing::RQplt.Value;
-			int nPlayersGT = Vars::Misc::Queueing::RQpgt.Value;
-			if ((nPlayersLT > 0 && nPlayerCount < nPlayersLT) || (nPlayersGT > 0 && nPlayerCount > nPlayersGT))
-				bRQConditionMet = true;
-		}
+        // Handling Requeue (RQif)
+        if (bInGame && bRQConditionMet)
+        {
+            if (Vars::Misc::Queueing::RQnoAbandon.Value)
+            {
+                // Queue while in game (Double Queue)
+                if (!bIsQueued)
+                {
+                    I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_Casual_Default);
+                    bQueuedCasual = true;
+                    SDK::Output("AutoQueue", std::format("RQif: Double queueing (Players: {}).", nPlayerCount).c_str(), { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                }
+            }
+            else
+            {
+                // Abandon and requeue
+                if ((flCurrentTime - flLastAbandonTime) > 5.0f) // Spam protection
+                {
+                    if (I::TFGCClientSystem) I::TFGCClientSystem->AbandonCurrentMatch();
+                    flLastAbandonTime = flCurrentTime;
+                    bQueuedCasual = false; // We will queue once disconnected
+                    SDK::Output("AutoQueue", std::format("RQif: Abandoning (Players: {}).", nPlayerCount).c_str(), { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                }
+            }
+        }
 
-		if (bIsQueued && bQueuedFromRQif)
-		{
-			bool bMaintainQueue = Vars::Misc::Queueing::RQif.Value && bInGame && bRQConditionMet;
-			if (!bMaintainQueue)
-			{
-				I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_Casual_Default);
-				SDK::Output("AutoQueue", "RQif conditions cleared, canceling casual queue", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-				bQueuedFromRQif = false;
-				flLastQueueTime = flCurrentTime;
-				bIsQueued = false;
-			}
-		}
+        // Standard Queue Logic
+        // Only proceed if we are NOT in a game and NOT connected
+        if (!bInGame && !bIsConnected && !bHasNetChannel)
+        {
+            float flQueueDelay = (Vars::Misc::Queueing::QueueDelay.Value == 0) ? 20.0f : Vars::Misc::Queueing::QueueDelay.Value * 60.0f;
+            
+            // If we just abandoned or disconnected, we might want to reset the timer if RQkick is enabled (instant queue)
+            if (Vars::Misc::Queueing::RQif.Value && Vars::Misc::Queueing::RQkick.Value)
+            {
+                // Logic handled by bRQConditionMet setting bQueuedCasual = false or abandoning
+            }
 
-		if (bIsQueued)
-		{
-			bWasInGame = bInGame;
-			return;
-		}
+            if (!bIsQueued)
+            {
+                bool bTimeToQueue = !bQueuedCasual || (flCurrentTime - flLastQueueTime >= flQueueDelay);
+                
+                if (bTimeToQueue)
+                {
+                    static bool bLoadedCriteria = false;
+                    if (!bLoadedCriteria && I::TFPartyClient)
+                    {
+                        I::TFPartyClient->LoadSavedCasualCriteria();
+                        bLoadedCriteria = true;
+                    }
 
-		if (bWasInGame && !bInGame && !bIsLoadingMap)
-		{
-			bWasDisconnected = true;
+                    if (I::TFPartyClient)
+                    {
+                        I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_Casual_Default);
+                        flLastQueueTime = flCurrentTime;
+                        bQueuedCasual = true;
+                        SDK::Output("AutoQueue", "Queued for Casual.", { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        if (bQueuedCasual && I::TFPartyClient)
+        {
+            I::TFPartyClient->CancelMatchQueueRequest(k_eTFMatchGroup_Casual_Default);
+            bQueuedCasual = false;
+        }
+    }
 
-			if (Vars::Misc::Queueing::RQif.Value && Vars::Misc::Queueing::RQkick.Value)
-				flLastQueueTime = 0.0f;
-		}
-
-		bWasInGame = bInGame;
-
-		if (bInGame && Vars::Misc::Queueing::RQif.Value && bRQConditionMet)
-		{
-			if (Vars::Misc::Queueing::RQnoAbandon.Value)
-			{
-				I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_Casual_Default);
-				flLastQueueTime = flCurrentTime;
-				bQueuedFromRQif = true;
-			}
-			else
-			{
-				I::TFGCClientSystem->AbandonCurrentMatch();
-				bWasInGame = false;
-				bWasDisconnected = true;
-				flLastQueueTime = 0.0f;
-				bQueuedFromRQif = false;
-			}
-		}
-
-		bool bShouldQueue = !bQueuedOnce || (flCurrentTime - flLastQueueTime >= flQueueDelay);
-		bool bStillAttachedToServer = bInGame || bIsConnected || bHasNetChannel;
-
-		if (bShouldQueue && !bIsLoadingMap && !bStillAttachedToServer)
-		{
-			static bool bHasLoaded = false;
-			if (!bHasLoaded)
-			{
-				I::TFPartyClient->LoadSavedCasualCriteria();
-				bHasLoaded = true;
-			}
-
-			I::TFPartyClient->RequestQueueForMatch(k_eTFMatchGroup_Casual_Default);
-			flLastQueueTime = flCurrentTime;
-			bQueuedOnce = true;
-			bWasDisconnected = false;
-			bQueuedFromRQif = false;
-		}
-	}
-	else
-	{
-		bQueuedOnce = false;
-		flLastQueueTime = 0.0f;
-		bQueuedFromRQif = false;
-	}
-
-	if (Vars::Misc::Queueing::AutoCommunityQueue.Value)
-		RunCommunityQueue();
-	else
-	{
-		CleanupServerList();
-		m_bConnectedToCommunityServer = false;
-		m_sCurrentServerIP.clear();
-	}
+    // 7. Community Queue
+    if (Vars::Misc::Queueing::AutoCommunityQueue.Value)
+    {
+        RunCommunityQueue();
+    }
+    else
+    {
+        CleanupServerList();
+        m_bConnectedToCommunityServer = false;
+        m_sCurrentServerIP.clear();
+    }
 }
 
 void CAutoQueue::RunCommunityQueue()
 {
-	if (!I::SteamMatchmakingServers)
-		return;
+    if (!I::SteamMatchmakingServers)
+        return;
 
-	bool bInGame = I::EngineClient->IsInGame();
-	bool bIsLoadingMap = I::EngineClient->IsDrawingLoadingImage();
-	if (bIsLoadingMap)
-		return;
+    const bool bInGame = I::EngineClient->IsInGame();
+    const bool bIsLoading = I::EngineClient->IsDrawingLoadingImage();
+    const float flCurrentTime = I::EngineClient->Time();
 
-	float flCurrentTime = I::EngineClient->Time();
+    if (bIsLoading) return;
 
-	static bool bWasInGameCommunity = false;
-	if (bWasInGameCommunity && !bInGame && m_bConnectedToCommunityServer)
-	{
-		HandleDisconnect();
-	}
-	bWasInGameCommunity = bInGame;
+    // Disconnect Handling
+    static bool bWasInGameCommunity = false;
+    if (bWasInGameCommunity && !bInGame && m_bConnectedToCommunityServer)
+    {
+        HandleDisconnect();
+    }
+    bWasInGameCommunity = bInGame;
 
-	if (bInGame && m_bConnectedToCommunityServer)
-	{
-		CheckServerTimeout();
-		return; // Don't search for new servers while connected
-	}
+    if (bInGame && m_bConnectedToCommunityServer)
+    {
+        CheckServerTimeout();
+        return;
+    }
 
-	if (!bInGame && !m_bSearchingServers)
-	{
-		float flSearchDelay = Vars::Misc::Queueing::ServerSearchDelay.Value;
-		if (flCurrentTime - m_flLastServerSearch >= flSearchDelay)
-			SearchCommunityServers();
-	}
+    if (!bInGame && !m_bSearchingServers)
+    {
+        float flSearchDelay = Vars::Misc::Queueing::ServerSearchDelay.Value;
+        if ((flCurrentTime - m_flLastServerSearch) >= flSearchDelay)
+            SearchCommunityServers();
+    }
 }
 
 void CAutoQueue::SearchCommunityServers()
 {
-	if (!I::SteamMatchmakingServers || m_bSearchingServers)
-		return;
+    if (!I::SteamMatchmakingServers || m_bSearchingServers)
+        return;
 
-	SDK::Output("AutoQueue", "Searching for community servers...", { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-	CleanupServerList();
+    SDK::Output("AutoQueue", "Searching for community servers...", { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    CleanupServerList();
 
-	std::vector<MatchMakingKeyValuePair_t> vFilters;
-	MatchMakingKeyValuePair_t tAppFilter; strcpy_s(tAppFilter.m_szKey, "appid"); strcpy_s(tAppFilter.m_szValue, "440"); vFilters.push_back(tAppFilter);
-	MatchMakingKeyValuePair_t tPlayersFilter; strcpy_s(tPlayersFilter.m_szKey, "hasplayers"); strcpy_s(tPlayersFilter.m_szValue, "1"); vFilters.push_back(tPlayersFilter);
-	MatchMakingKeyValuePair_t tNotFullFilter; strcpy_s(tNotFullFilter.m_szKey, "notfull"); strcpy_s(tNotFullFilter.m_szValue, "1"); vFilters.push_back(tNotFullFilter);
+    std::vector<MatchMakingKeyValuePair_t> vFilters;
+    
+    // Helper lambda to add filters
+    auto addFilter = [&vFilters](const char* key, const char* val) {
+        MatchMakingKeyValuePair_t filter;
+        strncpy_s(filter.m_szKey, key, sizeof(filter.m_szKey));
+        strncpy_s(filter.m_szValue, val, sizeof(filter.m_szValue));
+        vFilters.push_back(filter);
+    };
 
-	if (Vars::Misc::Queueing::AvoidPasswordServers.Value)
-	{
-		MatchMakingKeyValuePair_t tNoPasswordFilter; strcpy_s(tNoPasswordFilter.m_szKey, "nand"); strcpy_s(tNoPasswordFilter.m_szValue, "1"); vFilters.push_back(tNoPasswordFilter);
-		MatchMakingKeyValuePair_t tPasswordFilter; strcpy_s(tPasswordFilter.m_szKey, "password"); strcpy_s(tPasswordFilter.m_szValue, "1"); vFilters.push_back(tPasswordFilter);
-	}
-	if (Vars::Misc::Queueing::OnlyNonDedicatedServers.Value)
-	{
-		MatchMakingKeyValuePair_t tNandFilter; strcpy_s(tNandFilter.m_szKey, "nand"); strcpy_s(tNandFilter.m_szValue, "1"); vFilters.push_back(tNandFilter);
-		MatchMakingKeyValuePair_t tDedicatedFilter; strcpy_s(tDedicatedFilter.m_szKey, "dedicated"); strcpy_s(tDedicatedFilter.m_szValue, "1"); vFilters.push_back(tDedicatedFilter);
-	}
+    addFilter("appid", "440");
+    addFilter("hasplayers", "1");
+    addFilter("notfull", "1");
 
-	MatchMakingKeyValuePair_t* pFilters = vFilters.empty() ? nullptr : vFilters.data();
-	m_hServerListRequest = I::SteamMatchmakingServers->RequestInternetServerList(
-		440,
-		&pFilters,
-		vFilters.size(),
-		this
-	);
+    if (Vars::Misc::Queueing::AvoidPasswordServers.Value)
+    {
+        addFilter("nand", "1");
+        addFilter("password", "1");
+    }
+    if (Vars::Misc::Queueing::OnlyNonDedicatedServers.Value)
+    {
+        addFilter("nand", "1");
+        addFilter("dedicated", "1");
+    }
 
-	if (m_hServerListRequest)
-	{
-		m_bSearchingServers = true;
-		m_flLastServerSearch = I::EngineClient->Time();
-	}
+    m_hServerListRequest = I::SteamMatchmakingServers->RequestInternetServerList(
+        440,
+        vFilters.data(),
+        static_cast<int>(vFilters.size()),
+        this
+    );
+
+    if (m_hServerListRequest)
+    {
+        m_bSearchingServers = true;
+        m_flLastServerSearch = I::EngineClient->Time();
+    }
 }
 
 void CAutoQueue::ConnectToServer(const gameserveritem_t* pServer)
 {
-	if (!pServer)
-		return;
+    if (!pServer) return;
 
-	std::string sServerAddress = pServer->m_NetAdr.GetConnectionAddressString();
+    std::string sServerAddress = pServer->m_NetAdr.GetConnectionAddressString();
+    
+    // Avoid connecting to the same server twice in a row immediately
+    if (sServerAddress == m_sCurrentServerIP && (I::EngineClient->Time() - m_flServerJoinTime) < 60.0f)
+        return;
 
-	char msg[256];
-	snprintf(msg, sizeof(msg), "Connecting to server: %s (%s)", pServer->GetName(), sServerAddress.c_str());
-	SDK::Output("AutoQueue", msg, { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    SDK::Output("AutoQueue", std::format("Connecting to: {} [{}]", pServer->GetName(), sServerAddress).c_str(), { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
 
-	std::string sConnectCmd = std::string("connect ") + sServerAddress;
-	I::EngineClient->ClientCmd_Unrestricted(sConnectCmd.c_str());
+    std::string sConnectCmd = "connect " + sServerAddress;
+    I::EngineClient->ClientCmd_Unrestricted(sConnectCmd.c_str());
 
-	m_sCurrentServerIP = sServerAddress;
-	m_flServerJoinTime = I::EngineClient->Time();
-	m_bConnectedToCommunityServer = true;
+    m_sCurrentServerIP = sServerAddress;
+    m_flServerJoinTime = I::EngineClient->Time();
+    m_bConnectedToCommunityServer = true;
 }
 
 bool CAutoQueue::IsServerValid(const gameserveritem_t* pServer)
 {
-	if (!pServer || !pServer->m_bHadSuccessfulResponse)
-		return false;
+    if (!pServer || !pServer->m_bHadSuccessfulResponse)
+        return false;
 
-	if (Vars::Misc::Queueing::AvoidPasswordServers.Value && pServer->m_bPassword)
-		return false;
+    if (Vars::Misc::Queueing::AvoidPasswordServers.Value && pServer->m_bPassword)
+        return false;
 
-	if (pServer->m_nPlayers >= pServer->m_nMaxPlayers)
-		return false;
+    if (pServer->m_nPlayers >= pServer->m_nMaxPlayers)
+        return false;
 
-	int nPlayers = pServer->m_nPlayers - pServer->m_nBotPlayers;
-	if (nPlayers < Vars::Misc::Queueing::MinPlayersOnServer.Value ||
-		nPlayers > Vars::Misc::Queueing::MaxPlayersOnServer.Value)
-		return false;
+    int nHumanPlayers = pServer->m_nPlayers - pServer->m_nBotPlayers;
+    if (nHumanPlayers < Vars::Misc::Queueing::MinPlayersOnServer.Value ||
+        nHumanPlayers > Vars::Misc::Queueing::MaxPlayersOnServer.Value)
+        return false;
 
-	if (Vars::Misc::Queueing::PreferSteamNickServers.Value)
-	{
-		if (!IsServerNameMatch(pServer->GetName()))
-			return false;
-	}
+    if (Vars::Misc::Queueing::RequireNavmesh.Value && !HasNavmeshForMap(pServer->m_szMap))
+        return false;
 
-	if (Vars::Misc::Queueing::RequireNavmesh.Value)
-	{
-		if (!HasNavmeshForMap(pServer->m_szMap))
-			return false;
-	}
+    // IMPORTANT FIX: "PreferSteamNick" should NOT be a hard validator.
+    // If no named servers are found, we should still join normal servers.
+    // Moved this check to RefreshComplete for sorting priority only.
 
-	if (Vars::Misc::Queueing::OnlySteamNetworkingIPs.Value)
-	{
-		std::string sServerIP = pServer->m_NetAdr.GetConnectionAddressString();
-		if (sServerIP.rfind("169.254", 0) != 0)
-			return false;
-	}
+    if (Vars::Misc::Queueing::OnlySteamNetworkingIPs.Value)
+    {
+        std::string sServerIP = pServer->m_NetAdr.GetConnectionAddressString();
+        
+        if (sServerIP.rfind("169.254", 0) != 0) return false; 
+    }
 
-	return true;
+    return true;
 }
 
 bool CAutoQueue::HasNavmeshForMap(const std::string& sMapName)
 {
-	auto sNavPath = F::NavEngine.GetNavFilePath();
-	if (sNavPath.empty())
-		return false;
+    std::string sNavPath = F::NavEngine.GetNavFilePath();
+    if (sNavPath.empty()) return false;
 
-	const size_t uFirstAfterLastSlash = sNavPath.find_last_of("/\\") + 1;
-	if (sNavPath.find(sMapName, uFirstAfterLastSlash) != uFirstAfterLastSlash)
-		return F::NavEngine.IsNavMeshLoaded();
+    // Check if current loaded navmesh matches
+    if (F::NavEngine.IsNavMeshLoaded())
+    {
+        const size_t uFirstAfterLastSlash = sNavPath.find_last_of("/\\") + 1;
+        if (sNavPath.find(sMapName, uFirstAfterLastSlash) == uFirstAfterLastSlash)
+            return true;
+    }
 
-	std::ifstream navFile(sNavPath, std::ios::binary);
-	if (!navFile.is_open())
-		return false;
+    // Check file on disk
+    std::ifstream navFile(sNavPath, std::ios::binary);
+    if (!navFile.is_open()) return false;
 
-	uint32_t uMagic;
-	navFile.read(reinterpret_cast<char*>(&uMagic), sizeof(uint32_t));
-	return uMagic == 0xFEEDFACE;
+    uint32_t uMagic = 0;
+    navFile.read(reinterpret_cast<char*>(&uMagic), sizeof(uint32_t));
+    return uMagic == 0xFEEDFACE;
 }
 
 bool CAutoQueue::IsServerNameMatch(const std::string& sServerName)
 {
-	if (sServerName.length() < 10)
-		return false;
+    // Check for "'s Server" pattern (e.g., "SteamUser's Server")
+    size_t sServerPos = sServerName.rfind("'s Server");
+    if (sServerPos == std::string::npos) return false;
+    
+    // Basic validation
+    if (sServerPos < 2) return false;
+    if (sServerName.length() > sServerPos + 9)
+    {
+        char cNextChar = sServerName[sServerPos + 9];
+        if (cNextChar != ' ' && cNextChar != '\t' && cNextChar != '(' && cNextChar != '\0')
+            return false;
+    }
 
-	size_t sServerPos = sServerName.rfind("'s Server");
-	if (sServerPos == std::string::npos)
-		return false;
-
-	size_t uExpectedEnd = sServerPos + 9;
-	if (uExpectedEnd < sServerName.length())
-	{
-		char cNextChar = sServerName[uExpectedEnd];
-		if (cNextChar != ' ' && cNextChar != '\t' && cNextChar != '(' && cNextChar != '\0')
-			return false;
-	}
-
-	if (sServerPos < 2)
-		return false;
-
-	return true;
+    return true;
 }
 
 void CAutoQueue::CleanupServerList()
 {
-	if (m_hServerListRequest && I::SteamMatchmakingServers)
-	{
-		I::SteamMatchmakingServers->ReleaseRequest(m_hServerListRequest);
-		m_hServerListRequest = nullptr;
-	}
-
-	m_vCommunityServers.clear();
-	m_bSearchingServers = false;
+    if (m_hServerListRequest && I::SteamMatchmakingServers)
+    {
+        I::SteamMatchmakingServers->ReleaseRequest(m_hServerListRequest);
+        m_hServerListRequest = nullptr;
+    }
+    m_vCommunityServers.clear();
+    m_bSearchingServers = false;
 }
 
 void CAutoQueue::HandleDisconnect()
 {
-	SDK::Output("AutoQueue", "Disconnected from community server, searching for new one...", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-
-	m_bConnectedToCommunityServer = false;
-	m_sCurrentServerIP.clear();
-	m_flServerJoinTime = 0.0f;
-
-	m_flLastServerSearch = I::EngineClient->Time() - Vars::Misc::Queueing::ServerSearchDelay.Value + 5.0f;
+    SDK::Output("AutoQueue", "Disconnected from community server.", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    m_bConnectedToCommunityServer = false;
+    m_sCurrentServerIP.clear();
+    m_flServerJoinTime = 0.0f;
+    m_flLastServerSearch = I::EngineClient->Time() - Vars::Misc::Queueing::ServerSearchDelay.Value + 5.0f; // Search soon
 }
 
 void CAutoQueue::CheckServerTimeout()
 {
-	float flCurrentTime = I::EngineClient->Time();
-	float flMaxTime = Vars::Misc::Queueing::MaxTimeOnServer.Value;
+    if (Vars::Misc::Queueing::MaxTimeOnServer.Value <= 0.0f) return;
 
-	if (flCurrentTime - m_flServerJoinTime >= flMaxTime)
-	{
-		SDK::Output("AutoQueue", "Max time on server reached, disconnecting...", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-		I::EngineClient->ClientCmd_Unrestricted("disconnect");
-	}
+    float flTimeOnServer = I::EngineClient->Time() - m_flServerJoinTime;
+    if (flTimeOnServer >= Vars::Misc::Queueing::MaxTimeOnServer.Value)
+    {
+        SDK::Output("AutoQueue", "Max time on server reached, disconnecting...", { 255, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+        I::EngineClient->ClientCmd_Unrestricted("disconnect");
+    }
 }
 
 void CAutoQueue::ServerResponded(HServerListRequest hRequest, int iServer)
 {
-	if (hRequest != m_hServerListRequest || !I::SteamMatchmakingServers)
-		return;
+    if (hRequest != m_hServerListRequest || !I::SteamMatchmakingServers) return;
 
-	gameserveritem_t* pServer = I::SteamMatchmakingServers->GetServerDetails(hRequest, iServer);
-	if (pServer && IsServerValid(pServer))
-		m_vCommunityServers.push_back(pServer);
+    gameserveritem_t* pServer = I::SteamMatchmakingServers->GetServerDetails(hRequest, iServer);
+    if (pServer && IsServerValid(pServer))
+        m_vCommunityServers.push_back(pServer);
 }
 
-void CAutoQueue::ServerFailedToRespond(HServerListRequest hRequest, int iServer)
-{
-	// Nothing to do here
-}
+void CAutoQueue::ServerFailedToRespond(HServerListRequest hRequest, int iServer) { }
 
 void CAutoQueue::RefreshComplete(HServerListRequest hRequest, EMatchMakingServerResponse response)
 {
-	if (hRequest != m_hServerListRequest)
-		return;
+    if (hRequest != m_hServerListRequest) return;
 
-	m_bSearchingServers = false;
+    m_bSearchingServers = false;
+    SDK::Output("AutoQueue", std::format("Found {} valid servers.", m_vCommunityServers.size()).c_str(), { 100, 255, 100 }, OUTPUT_CONSOLE);
 
-	char msg[128];
-	snprintf(msg, sizeof(msg), "Found %zu valid community servers", m_vCommunityServers.size());
-	SDK::Output("AutoQueue", msg, { 100, 255, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    if (!m_vCommunityServers.empty())
+    {
+        // Sort: Prefer Steam Nick Servers, then by player count
+        std::sort(m_vCommunityServers.begin(), m_vCommunityServers.end(),
+            [this](const gameserveritem_t* a, const gameserveritem_t* b) -> bool
+            {
+                bool aIsNick = IsServerNameMatch(a->GetName());
+                bool bIsNick = IsServerNameMatch(b->GetName());
 
-	if (!m_vCommunityServers.empty())
-	{
-		std::sort(m_vCommunityServers.begin(), m_vCommunityServers.end(),
-				  [this](const gameserveritem_t* a, const gameserveritem_t* b) -> bool
-				  {
-					  bool aIsNickServer = IsServerNameMatch(a->GetName());
-					  bool bIsNickServer = IsServerNameMatch(b->GetName());
+                if (aIsNick != bIsNick) return aIsNick; // Nick servers first
 
-					  if (aIsNickServer != bIsNickServer)
-						  return aIsNickServer;
+                int aPlayers = a->m_nPlayers - a->m_nBotPlayers;
+                int bPlayers = b->m_nPlayers - b->m_nBotPlayers;
+                return aPlayers > bPlayers; // Most players first
+            });
 
-					  return (a->m_nPlayers - a->m_nBotPlayers) > (b->m_nPlayers - b->m_nBotPlayers);
-				  });
+        ConnectToServer(m_vCommunityServers[0]);
+    }
+    else
+    {
+        SDK::Output("AutoQueue", "No valid community servers found. Retrying...", { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
+    }
 
-		ConnectToServer(m_vCommunityServers[0]);
-	}
-	else
-		SDK::Output("AutoQueue", "No valid community servers found", { 255, 100, 100 }, OUTPUT_CONSOLE | OUTPUT_TOAST, -1);
-
-	CleanupServerList();
+    CleanupServerList();
 }
