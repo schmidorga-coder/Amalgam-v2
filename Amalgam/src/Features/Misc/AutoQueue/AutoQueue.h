@@ -62,7 +62,7 @@ public:
     void Run();
 
     // Virtual Destructor: Important for 64-bit inheritance safety
-    virtual ~CAutoQueue() override = default;
+    virtual ~CAutoQueue() {}
 
     // ===================================================================
     // ISteamMatchmakingServerListResponse INTERFACE
